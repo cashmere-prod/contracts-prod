@@ -2,13 +2,12 @@
 pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/access/AccessControl.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import {ITokenMessenger} from "./circle/ITokenMessenger.sol";
 import {ITokenMessengerV2} from "./circle/ITokenMessengerV2.sol";
 
-contract CashmereCCTP is AccessControl, ReentrancyGuard {
+contract CashmereCCTP is AccessControl {
     error FeeExceedsAmount();
     error TransferFailed();
     error NativeTransferFailed();
@@ -20,28 +19,36 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
     error NativeAmountTooLow();
 
     error GasDropLimitExceeded();
+    error WithdrawCooldownNotPassed();
+    error WithdrawLimitExceeded();
+
+    error ReentrancyError();
 
     uint256 private constant BP = 10000;
     bytes32 private constant EMPTY_BYTES32 = bytes32(0);
 
-    uint256 public nonce = 0;
-    uint256 public feeBP = 0;
+    struct State {
+        uint256 lastFeeWithdrawTimestamp;
+        uint64 maxUSDCGasDrop;
+        uint32 nonce;
+        uint16 feeBP;
+        bool reentrancyLock;
+        address signer;
+    }
+
+    State public state;
+    mapping (uint32 => uint256) public maxNativeGasDrop;
 
     uint32 public immutable localDomain;
     ITokenMessenger public immutable tokenMessenger;
     ITokenMessengerV2 public immutable tokenMessengerV2;
     address public immutable usdc;
-    address public signer;
-
-    // Max gas drop configurable (default 100 USDC in micro)
-    uint64 public maxUSDCGasDrop = 100_000_000; // 100 USDC
-    mapping (uint32 => uint256) public maxNativeGasDrop;
 
     uint256 private constant MAX_FEE_BP = 100; // 1%
+    uint256 private constant FEE_WITHDRAW_COOLDOWN = 4 hours;
+    uint256 private constant FEE_WITHDRAW_LIMIT = 10000 * 1e6; // 10000 USDC
 
-    event TransferNonce(uint256 indexed nonce);
-
-    event FeeBPUpdated(uint256 feeBP);
+    event FeeBPUpdated(uint16 feeBP);
     event SignerUpdated(address newSigner);
     event FeeWithdraw(address destination, uint256 amount, uint256 nativeAmount);
 
@@ -61,30 +68,29 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
 
     struct TransferParams {
         uint256 amount;
-        uint32 destinationDomain;
-        bytes32 recipient;
-        bytes32 solanaOwner;
         uint64 fee;
         uint64 deadline;
         uint64 gasDropAmount;
+        uint32 destinationDomain;
+        bytes32 recipient;
+        bytes32 solanaOwner;
         bool isNative;
         bytes signature;
     }
 
     struct TransferV2Params {
         uint256 amount;
-        uint32 destinationDomain;
-        bytes32 recipient;
-        // bytes32 solanaOwner; - solana is not supported in V2
+        uint256 maxFee;
         uint64 fee;
         uint64 deadline;
         uint64 gasDropAmount;
-        bool isNative;
-        bytes signature;
-
-        uint256 maxFee;
+        uint32 destinationDomain;
         uint32 minFinalityThreshold;
+        bytes32 recipient;
+        // bytes32 solanaOwner; - solana is not supported in V2
+        bool isNative;
         bytes hookData;
+        bytes signature;
     }
 
     struct PermitParams {
@@ -102,6 +108,8 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
         tokenMessengerV2 = ITokenMessengerV2(_tokenMessengerV2);
         localDomain = tokenMessenger.localMessageTransmitter().localDomain();
         usdc = _usdc;
+
+        state.maxUSDCGasDrop = 100_000_000; // 100 USDC
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
 
@@ -132,11 +140,19 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
             v := byte(0, mload(add(_sig, 96)))
         }
 
-        if (ecrecover(_hash, v, r, s) != signer) {
+        if (ecrecover(_hash, v, r, s) != state.signer) {
             revert InvalidSignature();
         }
 
         _;
+    }
+
+    modifier nonReentrant() {
+        if (state.reentrancyLock)
+            revert ReentrancyError();
+        state.reentrancyLock = true;
+        _;
+        state.reentrancyLock = false;
     }
 
     function _transferFrom(address from, address to, uint256 amount) private {
@@ -158,23 +174,23 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
         uint256 _amount,
         uint256 _staticFee
     ) public view returns (uint256) {
-        return (_amount * feeBP) / BP + _staticFee;
+        return (_amount * state.feeBP) / BP + _staticFee;
     }
 
-    function setFeeBP(uint128 _feeBP) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setFeeBP(uint16 _feeBP) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_feeBP <= MAX_FEE_BP, "fee too high");
-        feeBP = _feeBP;
+        state.feeBP = _feeBP;
         emit FeeBPUpdated(_feeBP);
     }
 
     function setSigner(address _signer) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        signer = _signer;
+        state.signer = _signer;
         emit SignerUpdated(_signer);
     }
 
     function setMaxUSDCGasDrop(uint64 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_newLimit > 0, "invalid");
-        maxUSDCGasDrop = _newLimit;
+        state.maxUSDCGasDrop = _newLimit;
         emit MaxUSDCGasDropUpdated(_newLimit);
     }
 
@@ -189,6 +205,14 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
         uint256 _nativeAmount,
         address _destination
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (block.timestamp - state.lastFeeWithdrawTimestamp < FEE_WITHDRAW_COOLDOWN) {
+            revert WithdrawCooldownNotPassed();
+        }
+
+        if (_usdcAmount > FEE_WITHDRAW_LIMIT) {
+            revert WithdrawLimitExceeded();
+        }
+
         IERC20(usdc).transfer(_destination, _usdcAmount);
         (bool success, ) = payable(_destination).call{value: _nativeAmount}("");
         if (!success) {
@@ -251,7 +275,7 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
             if (maxNativeGasDrop_ != 0 && _params.gasDropAmount > maxNativeGasDrop_)
                 revert GasDropLimitExceeded();
         } else {
-            uint256 maxUSDCGasDrop_ = maxUSDCGasDrop;
+            uint256 maxUSDCGasDrop_ = state.maxUSDCGasDrop;
             if (maxUSDCGasDrop_ != 0 && _params.gasDropAmount > maxUSDCGasDrop_)
                 revert GasDropLimitExceeded();
         }
@@ -287,7 +311,7 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
 
         emit CashmereTransfer(
             _params.destinationDomain,
-            nonce,
+            state.nonce++,
             _params.recipient,
             _params.solanaOwner,
             msg.sender,
@@ -295,8 +319,6 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
             _params.gasDropAmount,
             _params.isNative
         );
-
-        emit TransferNonce(++nonce);
     }
 
     function _transferV2(
@@ -326,7 +348,7 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
             if (maxNativeGasDrop_ != 0 && _params.gasDropAmount > maxNativeGasDrop_)
                 revert GasDropLimitExceeded();
         } else {
-            uint256 maxUSDCGasDrop_ = maxUSDCGasDrop;
+            uint256 maxUSDCGasDrop_ = state.maxUSDCGasDrop;
             if (maxUSDCGasDrop_ != 0 && _params.gasDropAmount > maxUSDCGasDrop_)
                 revert GasDropLimitExceeded();
         }
@@ -366,7 +388,7 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
 
         emit CashmereTransfer(
             _params.destinationDomain,
-            nonce,
+            state.nonce++,
             _params.recipient,
             bytes32(0),
             msg.sender,
@@ -374,8 +396,6 @@ contract CashmereCCTP is AccessControl, ReentrancyGuard {
             _params.gasDropAmount,
             _params.isNative
         );
-
-        emit TransferNonce(++nonce);
     }
 
     // --- Permit variant --------------------------------------------------
