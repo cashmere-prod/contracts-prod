@@ -32,10 +32,16 @@ pub enum TransferError {
     FeeExceedsAmount,
     #[msg("Insufficient SOL amount")]
     NativeAmountTooLow,
+    #[msg("Contract is paused")]
+    Paused,
 }
 
 #[error_code]
 pub enum ParamError {
     #[msg("Fee basis points too high")]
     FeeTooHigh,
+    #[msg("Only admin can update parameters")]
+    AdminUnauthorized,
+    #[msg("Invalid domain")]
+    InvalidDomain,
 }

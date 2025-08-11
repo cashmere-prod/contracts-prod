@@ -1,9 +1,11 @@
 use std::mem;
 use anchor_lang::prelude::*;
 use mem::size_of;
-use crate::state::{
-    Custodian,
-    Config,
+use crate::{
+    state::{
+        Custodian,
+        Config,
+    },
 };
 
 pub fn initialize_ix(
@@ -13,12 +15,13 @@ pub fn initialize_ix(
     gas_drop_collector_sol: Pubkey,
     gas_drop_collector_usdc: Pubkey,
 ) -> Result<()> {
+    ctx.accounts.config.paused = false;
     ctx.accounts.config.owner = ctx.accounts.owner.key();
     ctx.accounts.config.fee_collector_sol = fee_collector_sol;
     ctx.accounts.config.fee_collector_usdc = fee_collector_usdc;
     ctx.accounts.config.gas_drop_collector_sol = gas_drop_collector_sol;
     ctx.accounts.config.gas_drop_collector_usdc = gas_drop_collector_usdc;
-    ctx.accounts.config.fee_bp = 1;
+    ctx.accounts.config.fee_bp = 0;
     ctx.accounts.config.nonce = 0;
     ctx.accounts.config.max_usdc_gas_drop = 100_000_000;
     ctx.accounts.config.max_native_gas_drop = [0u64; 32];

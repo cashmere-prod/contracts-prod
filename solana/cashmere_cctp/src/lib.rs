@@ -8,7 +8,7 @@ pub mod utils;
 use anchor_lang::prelude::*;
 use instructions::*;
 
-declare_id!("4zNrqVWiVDUr26FJeVoXKVzA2jxMHErW1ZUmJo11DNiX");
+declare_id!("3oavKQXYAuaUgXdGPWHVM9nCY8jFQr1BLNmfZUESthSa");
 
 #[program]
 pub mod cashmere_cctp {
@@ -85,6 +85,34 @@ pub mod cashmere_cctp {
             deadline,
             gas_drop_amount,
             fee_is_native,
+        )
+    }
+
+    pub fn transfer_v2(
+        ctx: Context<TransferV2Context>,
+        usdc_amount: u64,
+        destination_domain: u32,
+        recipient: [u8; 32],
+        solana_owner: [u8; 32],
+        fee: u64,
+        deadline: u64,
+        gas_drop_amount: u64,
+        fee_is_native: bool,
+        max_fee: u64,
+        min_finality_threshold: u32,
+    ) -> Result<()> {
+        transfer_v2_ix(
+            ctx,
+            usdc_amount,
+            destination_domain,
+            recipient,
+            solana_owner,
+            fee,
+            deadline,
+            gas_drop_amount,
+            fee_is_native,
+            max_fee,
+            min_finality_threshold,
         )
     }
 }

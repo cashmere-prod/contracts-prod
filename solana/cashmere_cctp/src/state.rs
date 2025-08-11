@@ -26,6 +26,7 @@ pub struct Config {
     pub signer_key: [u8; 32],
     pub max_usdc_gas_drop: u64, // in micro-USDC (default 100m)
     pub max_native_gas_drop: [u64; 32],
+    pub paused: bool,
 }
 
 #[account]
@@ -36,4 +37,5 @@ pub struct Custodian {
 
 impl Custodian {
     pub const SEED_PREFIX: &'static [u8] = b"emitter";
+    pub const ATA_SEED_PREFIX: &'static [u8] = b"__custody";
 }
