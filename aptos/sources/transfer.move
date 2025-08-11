@@ -23,6 +23,7 @@ module cashmere_cctp::transfer {
     const E_GAS_DROP_LIMIT_EXCEEDED: u64 = 0x1002;
     const E_FEE_EXCEEDS_AMOUNT: u64 = 0x1003;
     const E_NATIVE_FEE_TOO_LOW: u64 = 0x1004;
+    const E_PAUSED: u64 = 0x1005;
 
     const E_NOT_AN_ADMIN: u64 = 0x2000;
 
@@ -36,6 +37,7 @@ module cashmere_cctp::transfer {
         signer_key: ed25519::UnvalidatedPublicKey,
         max_usdc_gas_drop: u64,
         max_native_gas_drop: table::Table<u32, u64>,
+        paused: bool,
     }
 
     struct TransferParams has drop, copy {
@@ -74,6 +76,7 @@ module cashmere_cctp::transfer {
             signer_key: ed25519::new_unvalidated_public_key_from_bytes(vector[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             max_usdc_gas_drop: 100_000_000,
             max_native_gas_drop: table::new<u32, u64>(),
+            paused: false,
         };
         move_to(&config_object_signer, config);
 
@@ -83,6 +86,12 @@ module cashmere_cctp::transfer {
         let admin_cap_object_signer = object::generate_signer(&admin_cap_constructor_ref);
 
         move_to(&admin_cap_object_signer, AdminCap {});
+    }
+
+    public fun set_paused(sender: &signer, auth: Object<AdminCap>, paused: bool) acquires Config {
+        assert!(object::is_owner(auth, signer::address_of(sender)), E_NOT_AN_ADMIN);
+        let config: &mut Config = borrow_global_mut(get_object_address());
+        config.paused = paused;
     }
 
     public fun set_fee_bp(sender: &signer, auth: Object<AdminCap>, fee_bp: u64) acquires Config {
@@ -119,7 +128,7 @@ module cashmere_cctp::transfer {
     public fun set_max_native_gas_drop(sender: &signer, auth: Object<AdminCap>, destination_domain: u32, new_limit: u64) acquires Config {
         assert!(object::is_owner(auth, signer::address_of(sender)), E_NOT_AN_ADMIN);
         let config: &mut Config = borrow_global_mut(get_object_address());
-        config.max_native_gas_drop.add(destination_domain, new_limit);
+        config.max_native_gas_drop.upsert(destination_domain, new_limit);
     }
 
     fun get_object_address(): address {
@@ -162,6 +171,7 @@ module cashmere_cctp::transfer {
         assert!(usdc_amount >= usdc_fee_amount, E_FEE_EXCEEDS_AMOUNT);
 
         let config: &mut Config = borrow_global_mut(get_object_address());
+        assert!(!config.paused, E_PAUSED);
         if (fee_is_native) {
             let native_gas_drop_limit = *config.max_native_gas_drop.borrow_with_default(destination_domain, &0u64);
             assert!(native_gas_drop_limit == 0 || gas_drop_amount <= native_gas_drop_limit, E_GAS_DROP_LIMIT_EXCEEDED);
