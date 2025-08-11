@@ -23,17 +23,20 @@ contract CashmereCCTP is AccessControl {
     error WithdrawLimitExceeded();
 
     error ReentrancyError();
+    error InvalidSignatureLength();
+    error Paused();
 
     uint256 private constant BP = 10000;
     bytes32 private constant EMPTY_BYTES32 = bytes32(0);
 
     struct State {
-        uint256 lastFeeWithdrawTimestamp;
+        address signer;
         uint64 maxUSDCGasDrop;
         uint32 nonce;
+        uint256 lastFeeWithdrawTimestamp;
         uint16 feeBP;
         bool reentrancyLock;
-        address signer;
+        bool paused;
     }
 
     State public state;
@@ -51,6 +54,7 @@ contract CashmereCCTP is AccessControl {
     event FeeBPUpdated(uint16 feeBP);
     event SignerUpdated(address newSigner);
     event FeeWithdraw(address destination, uint256 amount, uint256 nativeAmount);
+    event PausedUpdated(bool paused);
 
     event MaxUSDCGasDropUpdated(uint64 newLimit);
     event MaxNativeGasDropUpdated(uint32 destinaionDomain, uint256 newLimit);
@@ -87,7 +91,7 @@ contract CashmereCCTP is AccessControl {
         uint32 destinationDomain;
         uint32 minFinalityThreshold;
         bytes32 recipient;
-        // bytes32 solanaOwner; - solana is not supported in V2
+        bytes32 solanaOwner;
         bool isNative;
         bytes hookData;
         bytes signature;
@@ -120,7 +124,9 @@ contract CashmereCCTP is AccessControl {
         bytes32 r;
         bytes32 s;
         uint8 v;
-        require(_sig.length == 65, "invalid signature length");
+        if (_sig.length != 65) {
+            revert InvalidSignatureLength();
+        }
 
         assembly {
             /*
@@ -155,6 +161,12 @@ contract CashmereCCTP is AccessControl {
         state.reentrancyLock = false;
     }
 
+    modifier checkPause() {
+        if (state.paused)
+            revert Paused();
+        _;
+    }
+
     function _transferFrom(address from, address to, uint256 amount) private {
         (bool success, ) = usdc.call(
             abi.encodeWithSelector(
@@ -183,6 +195,11 @@ contract CashmereCCTP is AccessControl {
         emit FeeBPUpdated(_feeBP);
     }
 
+    function setPaused(bool _paused) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        state.paused = _paused;
+        emit PausedUpdated(_paused);
+    }
+
     function setSigner(address _signer) external onlyRole(DEFAULT_ADMIN_ROLE) {
         state.signer = _signer;
         emit SignerUpdated(_signer);
@@ -204,7 +221,7 @@ contract CashmereCCTP is AccessControl {
         uint256 _usdcAmount,
         uint256 _nativeAmount,
         address _destination
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
         if (block.timestamp - state.lastFeeWithdrawTimestamp < FEE_WITHDRAW_COOLDOWN) {
             revert WithdrawCooldownNotPassed();
         }
@@ -218,6 +235,7 @@ contract CashmereCCTP is AccessControl {
         if (!success) {
             revert NativeTransferFailed();
         }
+        state.lastFeeWithdrawTimestamp = block.timestamp;
         emit FeeWithdraw(_destination, _usdcAmount, _nativeAmount);
     }
 
@@ -247,6 +265,54 @@ contract CashmereCCTP is AccessControl {
         _transferV2(_params);
     }
 
+    function _beforeTransfer(
+        uint256 deadline,
+        uint256 amount,
+        uint32 destinationDomain,
+        bool isNative,
+        uint256 fee,
+        uint256 gasDropAmount
+    ) internal checkPause() returns (uint256) {
+        if (block.timestamp > deadline)
+            revert DeadlineExpired();
+
+        uint256 usdcTransferAmount = amount;
+        uint256 usdcFeeAmount = getFee(amount, isNative ? 0 : uint256(fee));
+        if (isNative) {
+            uint256 maxNativeGasDrop_ = maxNativeGasDrop[destinationDomain];
+            if (maxNativeGasDrop_ != 0 && gasDropAmount > maxNativeGasDrop_)
+                revert GasDropLimitExceeded();
+        } else {
+            uint256 maxUSDCGasDrop_ = state.maxUSDCGasDrop;
+            if (maxUSDCGasDrop_ != 0 && gasDropAmount > maxUSDCGasDrop_)
+                revert GasDropLimitExceeded();
+        }
+
+        if (!isNative)
+            usdcTransferAmount += gasDropAmount;
+
+        if (amount < usdcFeeAmount)
+            revert FeeExceedsAmount();
+
+        _transferFrom(msg.sender, address(this), usdcTransferAmount);
+        amount -= usdcFeeAmount;
+
+        if (isNative) {
+            uint256 nativeFeeAmount = fee + gasDropAmount;
+            if (nativeFeeAmount > msg.value) {
+                revert NativeAmountTooLow();
+            }
+            uint256 change = msg.value - nativeFeeAmount;
+            if (change > 0) {
+                (bool success, ) = msg.sender.call{value: change}("");
+                if (!success)
+                    revert NativeTransferFailed();
+            }
+        }
+
+        return amount;
+    }
+
     function _transfer(
         TransferParams memory _params
     )
@@ -265,45 +331,17 @@ contract CashmereCCTP is AccessControl {
             _params.signature
         )
     {
-        if (block.timestamp > _params.deadline)
-            revert DeadlineExpired();
-
-        uint256 usdcTransferAmount = _params.amount;
-        uint256 usdcFeeAmount = getFee(_params.amount, _params.isNative ? 0 : uint256(_params.fee));
-        if (_params.isNative) {
-            uint256 maxNativeGasDrop_ = maxNativeGasDrop[_params.destinationDomain];
-            if (maxNativeGasDrop_ != 0 && _params.gasDropAmount > maxNativeGasDrop_)
-                revert GasDropLimitExceeded();
-        } else {
-            uint256 maxUSDCGasDrop_ = state.maxUSDCGasDrop;
-            if (maxUSDCGasDrop_ != 0 && _params.gasDropAmount > maxUSDCGasDrop_)
-                revert GasDropLimitExceeded();
-        }
-
-        if (!_params.isNative)
-            usdcTransferAmount += _params.gasDropAmount;
-
-        if (_params.amount < usdcFeeAmount)
-            revert FeeExceedsAmount();
-
-        _transferFrom(msg.sender, address(this), usdcTransferAmount);
-        _params.amount -= usdcFeeAmount;
-
-        if (_params.isNative) {
-            uint256 nativeFeeAmount = _params.fee + _params.gasDropAmount;
-            if (_params.isNative && nativeFeeAmount > msg.value) {
-                revert NativeAmountTooLow();
-            }
-            uint256 change = msg.value - nativeFeeAmount;
-            if (change > 0) {
-                (bool success, ) = msg.sender.call{value: change}("");
-                if (!success)
-                    revert NativeTransferFailed();
-            }
-        }
+        uint256 amount = _beforeTransfer(
+            _params.deadline,
+            _params.amount,
+            _params.destinationDomain,
+            _params.isNative,
+            _params.fee,
+            _params.gasDropAmount
+        );
 
         tokenMessenger.depositForBurn(
-            _params.amount,
+            amount,
             _params.destinationDomain,
             _params.recipient,
             usdc
@@ -315,7 +353,7 @@ contract CashmereCCTP is AccessControl {
             _params.recipient,
             _params.solanaOwner,
             msg.sender,
-            _params.amount,
+            amount,
             _params.gasDropAmount,
             _params.isNative
         );
@@ -339,44 +377,17 @@ contract CashmereCCTP is AccessControl {
             _params.signature
         )
     {
-        if (block.timestamp > _params.deadline)
-            revert DeadlineExpired();
-
-        uint256 usdcFeeAmount = getFee(_params.amount, _params.isNative ? 0 : uint256(_params.fee));
-        if (_params.isNative) {
-            uint256 maxNativeGasDrop_ = maxNativeGasDrop[_params.destinationDomain];
-            if (maxNativeGasDrop_ != 0 && _params.gasDropAmount > maxNativeGasDrop_)
-                revert GasDropLimitExceeded();
-        } else {
-            uint256 maxUSDCGasDrop_ = state.maxUSDCGasDrop;
-            if (maxUSDCGasDrop_ != 0 && _params.gasDropAmount > maxUSDCGasDrop_)
-                revert GasDropLimitExceeded();
-        }
-
-        if (!_params.isNative)
-            usdcFeeAmount += _params.gasDropAmount;
-
-        if (_params.amount < usdcFeeAmount)
-            revert FeeExceedsAmount();
-
-        _transferFrom(msg.sender, address(this), _params.amount);
-        _params.amount -= usdcFeeAmount;
-
-        if (_params.isNative) {
-            uint256 nativeFeeAmount = _params.fee + _params.gasDropAmount;
-            if (_params.isNative && nativeFeeAmount > msg.value) {
-                revert NativeAmountTooLow();
-            }
-            uint256 change = msg.value - nativeFeeAmount;
-            if (change > 0) {
-                (bool success, ) = msg.sender.call{value: change}("");
-                if (!success)
-                    revert NativeTransferFailed();
-            }
-        }
+        uint256 amount = _beforeTransfer(
+            _params.deadline,
+            _params.amount,
+            _params.destinationDomain,
+            _params.isNative,
+            _params.fee,
+            _params.gasDropAmount
+        );
 
         tokenMessengerV2.depositForBurnWithHook(
-            _params.amount,
+            amount,
             _params.destinationDomain,
             _params.recipient,
             usdc,
@@ -390,9 +401,9 @@ contract CashmereCCTP is AccessControl {
             _params.destinationDomain,
             state.nonce++,
             _params.recipient,
-            bytes32(0),
+            _params.solanaOwner,
             msg.sender,
-            _params.amount,
+            amount,
             _params.gasDropAmount,
             _params.isNative
         );
