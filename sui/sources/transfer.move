@@ -9,7 +9,6 @@ module cashmere_cctp::transfer {
         coin,
         coin::Coin,
         event::emit,
-        vec_set,
         ed25519,
         bcs,
         clock::Clock,
@@ -25,6 +24,8 @@ module cashmere_cctp::transfer {
     const E_GAS_DROP_LIMIT_EXCEEDED: u64 = 0x1002;
     const E_FEE_EXCEEDS_AMOUNT: u64 = 0x1003;
     const E_NATIVE_FEE_TOO_LOW: u64 = 0x1004;
+    const E_DUPLICATE_NONCE: u64 = 0x1005;
+    const E_PAUSED: u64 = 0x1006;
 
     public struct AdminCap has key, store {
         id: UID
@@ -36,10 +37,11 @@ module cashmere_cctp::transfer {
         gas_drop_collector: address,
         fee_bp: u64,
         nonce: u256,
-        processed_cctp_nonces: vec_set::VecSet<u64>,
+        processed_cctp_nonces: table::Table<u64, bool>,
         signer_key: vector<u8>,
         max_usdc_gas_drop: u64,
         max_native_gas_drop: table::Table<u32, u64>,
+        paused: bool,
     }
 
     // Parameters that ARE INCLUDED in backend signature (gas_on_destination is **not** signed)
@@ -81,10 +83,11 @@ module cashmere_cctp::transfer {
             gas_drop_collector: ctx.sender(),
             fee_bp: 1,
             nonce: 0,
-            processed_cctp_nonces: vec_set::empty(),
+            processed_cctp_nonces: table::new<u64, bool>(ctx),
             signer_key: vector[],
             max_usdc_gas_drop: 100_000_000,
             max_native_gas_drop: table::new<u32, u64>(ctx),
+            paused: false,
         };
         transfer::share_object(config);
 
@@ -138,6 +141,8 @@ module cashmere_cctp::transfer {
         clock: &Clock,
         ctx: &mut TxContext,
     ): (DepositForBurnTicket<T, Auth>, DepositInfo) {
+        assert!(!config.paused, E_PAUSED);
+
         let auth = Auth {};
 
         let gas_drop_native = if (gas_drop_amount > 0 && fee_is_native) {
@@ -214,7 +219,8 @@ module cashmere_cctp::transfer {
     ) {
         // should abort on duplicate nonce
         // required because BurnMessage and Message are copyable
-        config.processed_cctp_nonces.insert(message.nonce());
+        assert!(!config.processed_cctp_nonces.contains(message.nonce()), E_DUPLICATE_NONCE);
+        config.processed_cctp_nonces.add(message.nonce(), true);
         config.nonce = config.nonce + 1;
         emit(CashmereTransfer {
             destination_domain: message.destination_domain(),
