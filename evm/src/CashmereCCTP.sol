@@ -11,11 +11,8 @@ contract CashmereCCTP is AccessControl {
     error FeeExceedsAmount();
     error TransferFailed();
     error NativeTransferFailed();
-    error ApprovalFailed();
     error InvalidSignature();
     error DeadlineExpired();
-    error InvalidSender();
-    error InvalidRecipient();
     error NativeAmountTooLow();
 
     error GasDropLimitExceeded();
