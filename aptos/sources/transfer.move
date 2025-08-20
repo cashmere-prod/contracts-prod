@@ -24,6 +24,7 @@ module cashmere_cctp::transfer {
     const E_FEE_EXCEEDS_AMOUNT: u64 = 0x1003;
     const E_NATIVE_FEE_TOO_LOW: u64 = 0x1004;
     const E_PAUSED: u64 = 0x1005;
+    const E_MAX_FEE_BP_EXCEEDED: u64 = 0x1006;
 
     const E_NOT_AN_ADMIN: u64 = 0x2000;
 
@@ -96,7 +97,7 @@ module cashmere_cctp::transfer {
 
     public fun set_fee_bp(sender: &signer, auth: Object<AdminCap>, fee_bp: u64) acquires Config {
         assert!(object::is_owner(auth, signer::address_of(sender)), E_NOT_AN_ADMIN);
-        assert!(fee_bp <= MAX_FEE_BP, 2);
+        assert!(fee_bp <= MAX_FEE_BP, E_MAX_FEE_BP_EXCEEDED);
         let config: &mut Config = borrow_global_mut(get_object_address());
         config.fee_bp = fee_bp;
     }

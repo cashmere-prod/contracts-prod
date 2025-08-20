@@ -28,6 +28,10 @@ pub mod cashmere_cctp {
 
     // admin ixs
 
+    pub fn set_paused(ctx: Context<ConfigContext>, paused: bool) -> Result<()> {
+        set_paused_ix(ctx, paused)
+    }
+
     pub fn set_fee_bp(ctx: Context<ConfigContext>, fee_bp: u64) -> Result<()> {
         set_fee_bp_ix(ctx, fee_bp)
     }

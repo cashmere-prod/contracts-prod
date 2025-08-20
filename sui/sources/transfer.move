@@ -94,6 +94,10 @@ module cashmere_cctp::transfer {
         transfer::transfer(AdminCap {id: object::new(ctx)}, ctx.sender());
     }
 
+    public fun set_paused(_: &AdminCap, config: &mut Config, paused: bool) {
+        config.paused = paused;
+    }
+
     public fun set_fee_bp(_: &AdminCap, config: &mut Config, fee_bp: u64) {
         assert!(fee_bp <= MAX_FEE_BP, 0x2000);
         config.fee_bp = fee_bp;
@@ -192,7 +196,7 @@ module cashmere_cctp::transfer {
             transfer::public_transfer(fee_coin, config.fee_collector);
         };
         // return native change
-        transfer::public_transfer(native_fee_coin, recipient);
+        transfer::public_transfer(native_fee_coin, ctx.sender());
 
         (
             create_deposit_for_burn_ticket<T, Auth>(

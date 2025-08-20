@@ -2,6 +2,12 @@ use anchor_lang::prelude::*;
 use crate::state::Config;
 use crate::errors::ParamError;
 
+pub fn set_paused_ix(ctx: Context<ConfigContext>, paused: bool) -> Result<()> {
+    require!(ctx.accounts.owner.key() == ctx.accounts.config.owner, ParamError::AdminUnauthorized);
+    ctx.accounts.config.paused = paused;
+    Ok(())
+}
+
 pub fn set_fee_bp_ix(ctx: Context<ConfigContext>, fee_bp: u64) -> Result<()> {
     require!(ctx.accounts.owner.key() == ctx.accounts.config.owner, ParamError::AdminUnauthorized);
     require!(fee_bp <= 100, ParamError::FeeTooHigh);

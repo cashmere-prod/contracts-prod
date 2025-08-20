@@ -43,6 +43,9 @@ contract CashmereCCTP is AccessControl {
     ITokenMessenger public immutable tokenMessenger;
     ITokenMessengerV2 public immutable tokenMessengerV2;
     address public immutable usdc;
+    /* NOTE: _transferFrom doesn't check return value, 
+             which might be correct only for USDC, but not for other tokens.
+     */
 
     uint256 private constant MAX_FEE_BP = 100; // 1%
     uint256 private constant FEE_WITHDRAW_COOLDOWN = 4 hours;
