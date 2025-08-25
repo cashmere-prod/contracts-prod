@@ -1,5 +1,4 @@
 module cashmere_cctp::transfer {
-    use aptos_std::table;
     use aptos_framework::fungible_asset;
     use aptos_framework::fungible_asset::FungibleAsset;
     use aptos_framework::primary_fungible_store;
@@ -37,7 +36,7 @@ module cashmere_cctp::transfer {
         nonce: u256,
         signer_key: ed25519::UnvalidatedPublicKey,
         max_usdc_gas_drop: u64,
-        max_native_gas_drop: table::Table<u32, u64>,
+        max_native_gas_drop: u64,
         paused: bool,
     }
 
@@ -76,7 +75,7 @@ module cashmere_cctp::transfer {
             nonce: 0,
             signer_key: ed25519::new_unvalidated_public_key_from_bytes(vector[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
             max_usdc_gas_drop: 100_000_000,
-            max_native_gas_drop: table::new<u32, u64>(),
+            max_native_gas_drop: 0,
             paused: false,
         };
         move_to(&config_object_signer, config);
@@ -126,10 +125,10 @@ module cashmere_cctp::transfer {
         config.max_usdc_gas_drop = new_limit;
     }
 
-    public fun set_max_native_gas_drop(sender: &signer, auth: Object<AdminCap>, destination_domain: u32, new_limit: u64) acquires Config {
+    public fun set_max_native_gas_drop(sender: &signer, auth: Object<AdminCap>, new_limit: u64) acquires Config {
         assert!(object::is_owner(auth, signer::address_of(sender)), E_NOT_AN_ADMIN);
         let config: &mut Config = borrow_global_mut(get_object_address());
-        config.max_native_gas_drop.upsert(destination_domain, new_limit);
+        config.max_native_gas_drop = new_limit;
     }
 
     fun get_object_address(): address {
@@ -174,8 +173,7 @@ module cashmere_cctp::transfer {
         let config: &mut Config = borrow_global_mut(get_object_address());
         assert!(!config.paused, E_PAUSED);
         if (fee_is_native) {
-            let native_gas_drop_limit = *config.max_native_gas_drop.borrow_with_default(destination_domain, &0u64);
-            assert!(native_gas_drop_limit == 0 || gas_drop_amount <= native_gas_drop_limit, E_GAS_DROP_LIMIT_EXCEEDED);
+            assert!(config.max_native_gas_drop == 0 || gas_drop_amount <= config.max_native_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
         } else {
             assert!(config.max_usdc_gas_drop == 0 || gas_drop_amount <= config.max_usdc_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
         };

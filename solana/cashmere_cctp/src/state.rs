@@ -25,7 +25,7 @@ pub struct Config {
     pub nonce: u64,
     pub signer_key: [u8; 32],
     pub max_usdc_gas_drop: u64, // in micro-USDC (default 100m)
-    pub max_native_gas_drop: [u64; 32],
+    pub max_native_gas_drop: u64,
     pub paused: bool,
 }
 

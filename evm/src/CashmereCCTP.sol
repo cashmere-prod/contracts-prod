@@ -30,17 +30,19 @@ contract CashmereCCTP is AccessControl {
     bytes32 private constant EMPTY_BYTES32 = bytes32(0);
 
     struct State {
-        address signer;
-        uint64 maxUSDCGasDrop;
-        uint32 nonce;
-        uint256 lastFeeWithdrawTimestamp;
-        uint16 feeBP;
-        bool reentrancyLock;
-        bool paused;
+        // -- slot (total 32 bytes)
+        address signer;  // 20 bytes
+        uint32 nonce;  // 4 bytes
+        uint32 maxUSDCGasDrop;  // 4 bytes, should be enough for $4k
+        uint16 feeBP;  // 2 bytes
+        bool reentrancyLock;  // 1 byte
+        bool paused; // 1 byte
+        // -- slot (total 32 bytes)
+        uint128 maxNativeGasDrop;  // 16 bytes, should be enough for 3e20 ether
+        uint128 lastFeeWithdrawTimestamp;  // 16 bytes
     }
 
     State public state;
-    mapping (uint32 => uint256) public maxNativeGasDrop;
 
     uint32 public immutable localDomain;
     ITokenMessenger public immutable tokenMessenger;
@@ -60,7 +62,7 @@ contract CashmereCCTP is AccessControl {
     event PausedUpdated(bool paused);
 
     event MaxUSDCGasDropUpdated(uint64 newLimit);
-    event MaxNativeGasDropUpdated(uint32 destinaionDomain, uint256 newLimit);
+    event MaxNativeGasDropUpdated(uint256 newLimit);
 
     event CashmereTransfer(
         uint32 destinationDomain,
@@ -210,7 +212,7 @@ contract CashmereCCTP is AccessControl {
         emit SignerUpdated(_signer);
     }
 
-    function setMaxUSDCGasDrop(uint64 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setMaxUSDCGasDrop(uint32 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_newLimit == 0) {
             revert ZeroLimit();
         }
@@ -218,12 +220,12 @@ contract CashmereCCTP is AccessControl {
         emit MaxUSDCGasDropUpdated(_newLimit);
     }
 
-    function setMaxNativeGasDrop(uint32 _destinationDomain, uint256 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setMaxNativeGasDrop(uint128 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_newLimit == 0) {
             revert ZeroLimit();
         }
-        maxNativeGasDrop[_destinationDomain] = _newLimit;
-        emit MaxNativeGasDropUpdated(_destinationDomain, _newLimit);
+        state.maxNativeGasDrop = _newLimit;
+        emit MaxNativeGasDropUpdated(_newLimit);
     }
 
     function withdrawFee(
@@ -231,7 +233,8 @@ contract CashmereCCTP is AccessControl {
         uint256 _nativeAmount,
         address _destination
     ) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
-        if (block.timestamp - state.lastFeeWithdrawTimestamp < FEE_WITHDRAW_COOLDOWN) {
+        uint128 timestamp = uint128(block.timestamp);
+        if (timestamp - state.lastFeeWithdrawTimestamp < FEE_WITHDRAW_COOLDOWN) {
             revert WithdrawCooldownNotPassed();
         }
 
@@ -244,7 +247,7 @@ contract CashmereCCTP is AccessControl {
         if (!success) {
             revert NativeTransferFailed();
         }
-        state.lastFeeWithdrawTimestamp = block.timestamp;
+        state.lastFeeWithdrawTimestamp = timestamp;
         emit FeeWithdraw(_destination, _usdcAmount, _nativeAmount);
     }
 
@@ -288,7 +291,7 @@ contract CashmereCCTP is AccessControl {
         uint256 usdcTransferAmount = amount;
         uint256 usdcFeeAmount = getFee(amount, isNative ? 0 : uint256(fee));
         if (isNative) {
-            uint256 maxNativeGasDrop_ = maxNativeGasDrop[destinationDomain];
+            uint256 maxNativeGasDrop_ = state.maxNativeGasDrop;
             if (maxNativeGasDrop_ != 0 && gasDropAmount > maxNativeGasDrop_)
                 revert GasDropLimitExceeded();
         } else {

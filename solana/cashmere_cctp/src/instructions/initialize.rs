@@ -24,7 +24,7 @@ pub fn initialize_ix(
     ctx.accounts.config.fee_bp = 0;
     ctx.accounts.config.nonce = 0;
     ctx.accounts.config.max_usdc_gas_drop = 100_000_000;
-    ctx.accounts.config.max_native_gas_drop = [0u64; 32];
+    ctx.accounts.config.max_native_gas_drop = 0;
     ctx.accounts.custodian.set_inner(Custodian {
         bump: ctx.bumps.custodian,
     });

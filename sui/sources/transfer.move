@@ -40,7 +40,7 @@ module cashmere_cctp::transfer {
         processed_cctp_nonces: table::Table<u64, bool>,
         signer_key: vector<u8>,
         max_usdc_gas_drop: u64,
-        max_native_gas_drop: table::Table<u32, u64>,
+        max_native_gas_drop: u64,
         paused: bool,
     }
 
@@ -86,7 +86,7 @@ module cashmere_cctp::transfer {
             processed_cctp_nonces: table::new<u64, bool>(ctx),
             signer_key: vector[],
             max_usdc_gas_drop: 100_000_000,
-            max_native_gas_drop: table::new<u32, u64>(ctx),
+            max_native_gas_drop: 0,
             paused: false,
         };
         transfer::share_object(config);
@@ -119,11 +119,8 @@ module cashmere_cctp::transfer {
         config.max_usdc_gas_drop = limit;
     }
 
-    public fun set_max_native_gas_drop(_: &AdminCap, config: &mut Config, destination_domain: u32, limit: u64) {
-        if (table::contains(&config.max_native_gas_drop, destination_domain)) {
-            table::remove(&mut config.max_native_gas_drop, destination_domain);
-        };
-        table::add(&mut config.max_native_gas_drop, destination_domain, limit);
+    public fun set_max_native_gas_drop(_: &AdminCap, config: &mut Config, limit: u64) {
+        config.max_native_gas_drop = limit;
     }
 
     public fun get_fee(config: &Config, amount: u64, static_fee: u64): u64 {
@@ -165,10 +162,7 @@ module cashmere_cctp::transfer {
         assert!(usdc_fee_amount <= usdc_value, E_FEE_EXCEEDS_AMOUNT);
 
         if (fee_is_native) {
-            if (table::contains(&config.max_native_gas_drop, destination_domain)) {
-                let native_gas_drop_limit = *table::borrow(&config.max_native_gas_drop, destination_domain);
-                assert!(gas_drop_amount <= native_gas_drop_limit, E_GAS_DROP_LIMIT_EXCEEDED);
-            }
+            assert!(config.max_native_gas_drop == 0 || gas_drop_amount <= config.max_native_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
         } else {
             assert!(config.max_usdc_gas_drop == 0 || gas_drop_amount <= config.max_usdc_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
         };

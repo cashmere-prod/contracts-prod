@@ -41,10 +41,9 @@ pub fn set_max_usdc_gas_drop_ix(ctx: Context<ConfigContext>, max_gas: u64) -> Re
     Ok(())
 }
 
-pub fn set_max_native_gas_drop_ix(ctx: Context<ConfigContext>, destination_domain: u32, max_gas: u64) -> Result<()> {
-    require!(destination_domain < 32, ParamError::InvalidDomain);
+pub fn set_max_native_gas_drop_ix(ctx: Context<ConfigContext>, max_gas: u64) -> Result<()> {
     require!(ctx.accounts.owner.key() == ctx.accounts.config.owner, ParamError::AdminUnauthorized);
-    ctx.accounts.config.max_native_gas_drop[destination_domain as usize] = max_gas;
+    ctx.accounts.config.max_native_gas_drop = max_gas;
     Ok(())
 }
 

@@ -52,8 +52,8 @@ pub mod cashmere_cctp {
         set_max_usdc_gas_drop_ix(ctx, max_gas)
     }
 
-    pub fn set_max_native_gas_drop(ctx: Context<ConfigContext>, destination_domain: u32, max_gas: u64) -> Result<()> {
-        set_max_native_gas_drop_ix(ctx, destination_domain, max_gas)
+    pub fn set_max_native_gas_drop(ctx: Context<ConfigContext>, max_gas: u64) -> Result<()> {
+        set_max_native_gas_drop_ix(ctx, max_gas)
     }
 
     pub fn transfer_ownership(ctx: Context<TransferOwnershipContext>, new_owner: Pubkey) -> Result<()> {
