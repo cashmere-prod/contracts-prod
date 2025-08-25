@@ -55,6 +55,11 @@ pub fn verify_ed25519_ix(instructions: &AccountInfo, msg: &[u8], pub_key: &[u8])
             != ed25519_offsets.public_key_offset + PUBKEY_SERIALIZED_SIZE as u16
         || ed25519_offsets.message_data_offset
             != ed25519_offsets.signature_offset + SIGNATURE_SERIALIZED_SIZE as u16
+
+        || (ed25519_offsets.public_key_offset as usize + PUBKEY_SERIALIZED_SIZE - 1)
+            > verify_instruction.data.len()
+        || (ed25519_offsets.message_data_offset + ed25519_offsets.message_data_size - 1) as usize
+            > verify_instruction.data.len()
     {
         return Err(SignatureVerificationError::InvalidSignatureData.into());
     }
@@ -75,8 +80,10 @@ pub fn verify_ed25519_ix(instructions: &AccountInfo, msg: &[u8], pub_key: &[u8])
     if pubkey.to_bytes() != pub_key {
         return Err(SignatureVerificationError::InvalidSignature.into());
     }
-
-    let message_data = &verify_instruction.data[ed25519_offsets.message_data_offset as usize..];
+    let message_data = &verify_instruction.data[
+        ed25519_offsets.message_data_offset as usize ..
+        (ed25519_offsets.message_data_offset + ed25519_offsets.message_data_size) as usize
+    ];
 
     if message_data != msg {
         return Err(SignatureVerificationError::InvalidMessageData.into());

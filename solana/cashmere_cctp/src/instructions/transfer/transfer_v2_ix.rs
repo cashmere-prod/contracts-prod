@@ -152,7 +152,7 @@ pub struct TransferV2Context<'info> {
 
     // Sender ATA
     #[account(mut, token::mint = burn_token_mint)]
-    pub owner_token_account: Account<'info, TokenAccount>,
+    pub owner_token_account: Box<Account<'info, TokenAccount>>,
 
     // CCTP Message account
     #[account(mut)]
@@ -172,7 +172,7 @@ pub struct TransferV2Context<'info> {
         mut,
         address = config.fee_collector_usdc,
     )]
-    pub fee_collector_usdc_account: Account<'info, TokenAccount>,
+    pub fee_collector_usdc_account: Box<Account<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -184,7 +184,7 @@ pub struct TransferV2Context<'info> {
         mut,
         address = config.gas_drop_collector_usdc,
     )]
-    pub gas_drop_collector_usdc_account: Account<'info, TokenAccount>,
+    pub gas_drop_collector_usdc_account: Box<Account<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
@@ -196,7 +196,7 @@ pub struct TransferV2Context<'info> {
         seeds = [Custodian::SEED_PREFIX],
         bump = custodian.bump,
     )]
-    custodian: Account<'info, Custodian>,
+    custodian: Box<Account<'info, Custodian>>,
 
     /// Circle-supported mint.
     ///
@@ -221,7 +221,7 @@ pub struct TransferV2Context<'info> {
         seeds = [Custodian::ATA_SEED_PREFIX],
         bump,
     )]
-    burn_token_account: Account<'info, token::TokenAccount>,
+    burn_token_account: Box<Account<'info, token::TokenAccount>>,
     
     /// CHECK: denylist PDA
     /// Account is denylisted if the account exists at the expected PDA.

@@ -23,6 +23,9 @@ contract CashmereCCTP is AccessControl {
     error InvalidSignatureLength();
     error Paused();
 
+    error BPTooHigh();
+    error ZeroLimit();
+
     uint256 private constant BP = 10000;
     bytes32 private constant EMPTY_BYTES32 = bytes32(0);
 
@@ -190,7 +193,9 @@ contract CashmereCCTP is AccessControl {
     }
 
     function setFeeBP(uint16 _feeBP) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_feeBP <= MAX_FEE_BP, "fee too high");
+        if (_feeBP > MAX_FEE_BP) {
+            revert BPTooHigh();
+        }
         state.feeBP = _feeBP;
         emit FeeBPUpdated(_feeBP);
     }
@@ -206,13 +211,17 @@ contract CashmereCCTP is AccessControl {
     }
 
     function setMaxUSDCGasDrop(uint64 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_newLimit > 0, "invalid");
+        if (_newLimit == 0) {
+            revert ZeroLimit();
+        }
         state.maxUSDCGasDrop = _newLimit;
         emit MaxUSDCGasDropUpdated(_newLimit);
     }
 
     function setMaxNativeGasDrop(uint32 _destinationDomain, uint256 _newLimit) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        require(_newLimit > 0, "invalid");
+        if (_newLimit == 0) {
+            revert ZeroLimit();
+        }
         maxNativeGasDrop[_destinationDomain] = _newLimit;
         emit MaxNativeGasDropUpdated(_destinationDomain, _newLimit);
     }
@@ -294,7 +303,8 @@ contract CashmereCCTP is AccessControl {
         if (amount < usdcFeeAmount)
             revert FeeExceedsAmount();
 
-        _transferFrom(msg.sender, address(this), usdcTransferAmount);
+        address sender = msg.sender;
+        _transferFrom(sender, address(this), usdcTransferAmount);
         amount -= usdcFeeAmount;
 
         if (isNative) {
@@ -304,7 +314,7 @@ contract CashmereCCTP is AccessControl {
             }
             uint256 change = msg.value - nativeFeeAmount;
             if (change > 0) {
-                (bool success, ) = msg.sender.call{value: change}("");
+                (bool success, ) = sender.call{value: change}("");
                 if (!success)
                     revert NativeTransferFailed();
             }
@@ -347,16 +357,18 @@ contract CashmereCCTP is AccessControl {
             usdc
         );
 
-        emit CashmereTransfer(
-            _params.destinationDomain,
-            state.nonce++,
-            _params.recipient,
-            _params.solanaOwner,
-            msg.sender,
-            amount,
-            _params.gasDropAmount,
-            _params.isNative
-        );
+        unchecked {
+            emit CashmereTransfer(
+                _params.destinationDomain,
+                state.nonce++,
+                _params.recipient,
+                _params.solanaOwner,
+                msg.sender,
+                amount,
+                _params.gasDropAmount,
+                _params.isNative
+            );
+        }
     }
 
     function _transferV2(
@@ -397,16 +409,18 @@ contract CashmereCCTP is AccessControl {
             _params.hookData
         );
 
-        emit CashmereTransfer(
-            _params.destinationDomain,
-            state.nonce++,
-            _params.recipient,
-            _params.solanaOwner,
-            msg.sender,
-            amount,
-            _params.gasDropAmount,
-            _params.isNative
-        );
+        unchecked {
+            emit CashmereTransfer(
+                _params.destinationDomain,
+                state.nonce++,
+                _params.recipient,
+                _params.solanaOwner,
+                msg.sender,
+                amount,
+                _params.gasDropAmount,
+                _params.isNative
+            );
+        }
     }
 
     // --- Permit variant --------------------------------------------------
