@@ -70,16 +70,16 @@ contract CashmereCCTP is AccessControl {
         bytes32 recipient,
         bytes32 solanaOwner,
         address indexed user,
-        uint256 amount,
+        uint64 amount,
         uint256 gasDropAmount,
         bool isNative
     );
 
     struct TransferParams {
-        uint256 amount;
-        uint64 fee;
+        uint64 amount;
+        uint128 fee;
         uint64 deadline;
-        uint64 gasDropAmount;
+        uint128 gasDropAmount;
         uint32 destinationDomain;
         bytes32 recipient;
         bytes32 solanaOwner;
@@ -88,11 +88,11 @@ contract CashmereCCTP is AccessControl {
     }
 
     struct TransferV2Params {
-        uint256 amount;
+        uint64 amount;
         uint256 maxFee;
-        uint64 fee;
+        uint128 fee;
         uint64 deadline;
-        uint64 gasDropAmount;
+        uint128 gasDropAmount;
         uint32 destinationDomain;
         uint32 minFinalityThreshold;
         bytes32 recipient;
@@ -188,10 +188,10 @@ contract CashmereCCTP is AccessControl {
     }
 
     function getFee(
-        uint256 _amount,
+        uint64 _amount,
         uint256 _staticFee
-    ) public view returns (uint256) {
-        return (_amount * state.feeBP) / BP + _staticFee;
+    ) public view returns (uint64) {
+        return uint64((_amount * state.feeBP) / BP + _staticFee);
     }
 
     function setFeeBP(uint16 _feeBP) external onlyRole(DEFAULT_ADMIN_ROLE) {
@@ -279,29 +279,27 @@ contract CashmereCCTP is AccessControl {
 
     function _beforeTransfer(
         uint256 deadline,
-        uint256 amount,
+        uint64 amount,
         uint32 destinationDomain,
         bool isNative,
         uint256 fee,
         uint256 gasDropAmount
-    ) internal checkPause() returns (uint256) {
+    ) internal checkPause() returns (uint64) {
         if (block.timestamp > deadline)
             revert DeadlineExpired();
 
-        uint256 usdcTransferAmount = amount;
-        uint256 usdcFeeAmount = getFee(amount, isNative ? 0 : uint256(fee));
+        uint64 usdcTransferAmount = amount;
+        uint64 usdcFeeAmount = getFee(amount, isNative ? 0 : uint64(fee));
         if (isNative) {
-            uint256 maxNativeGasDrop_ = state.maxNativeGasDrop;
-            if (maxNativeGasDrop_ != 0 && gasDropAmount > maxNativeGasDrop_)
+            if (gasDropAmount > state.maxNativeGasDrop)
                 revert GasDropLimitExceeded();
         } else {
-            uint256 maxUSDCGasDrop_ = state.maxUSDCGasDrop;
-            if (maxUSDCGasDrop_ != 0 && gasDropAmount > maxUSDCGasDrop_)
+            if (gasDropAmount > state.maxUSDCGasDrop)
                 revert GasDropLimitExceeded();
         }
 
         if (!isNative)
-            usdcTransferAmount += gasDropAmount;
+            usdcTransferAmount += uint64(gasDropAmount);
 
         if (amount < usdcFeeAmount)
             revert FeeExceedsAmount();
@@ -344,7 +342,7 @@ contract CashmereCCTP is AccessControl {
             _params.signature
         )
     {
-        uint256 amount = _beforeTransfer(
+        uint64 amount = _beforeTransfer(
             _params.deadline,
             _params.amount,
             _params.destinationDomain,
@@ -392,7 +390,7 @@ contract CashmereCCTP is AccessControl {
             _params.signature
         )
     {
-        uint256 amount = _beforeTransfer(
+        uint64 amount = _beforeTransfer(
             _params.deadline,
             _params.amount,
             _params.destinationDomain,

@@ -162,9 +162,9 @@ module cashmere_cctp::transfer {
         assert!(usdc_fee_amount <= usdc_value, E_FEE_EXCEEDS_AMOUNT);
 
         if (fee_is_native) {
-            assert!(config.max_native_gas_drop == 0 || gas_drop_amount <= config.max_native_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
+            assert!(gas_drop_amount <= config.max_native_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
         } else {
-            assert!(config.max_usdc_gas_drop == 0 || gas_drop_amount <= config.max_usdc_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
+            assert!(gas_drop_amount <= config.max_usdc_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
         };
 
         let msg_struct = TransferParams {

@@ -77,10 +77,10 @@ pub fn pre_transfer<'info>(
     require!(usdc_amount >= usdc_fee_amount, TransferError::FeeExceedsAmount);
     if fee_is_native {
         let native_gas_drop_limit = config.max_native_gas_drop;
-        require!(native_gas_drop_limit == 0 || gas_drop_amount <= native_gas_drop_limit, TransferError::GasDropLimitExceeded);
+        require!(gas_drop_amount <= native_gas_drop_limit, TransferError::GasDropLimitExceeded);
     } else {
         let usdc_gas_drop_limit = config.max_usdc_gas_drop;
-        require!(usdc_gas_drop_limit == 0 || gas_drop_amount <= usdc_gas_drop_limit, TransferError::GasDropLimitExceeded);
+        require!(gas_drop_amount <= usdc_gas_drop_limit, TransferError::GasDropLimitExceeded);
     }
 
     // collect fee in USDC
