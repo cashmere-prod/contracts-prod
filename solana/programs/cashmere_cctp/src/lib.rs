@@ -8,7 +8,7 @@ pub mod utils;
 use anchor_lang::prelude::*;
 use instructions::*;
 
-declare_id!("DmHLqQLHcVGDWPoYsiYvoG5beuxZicqPwrjuUvryatn8");
+declare_id!("5RsvKL6LFq6yEFiAXEwgYHAN3aLFypeB4AaafdeDnHqM");
 
 #[program]
 pub mod cashmere_cctp {
