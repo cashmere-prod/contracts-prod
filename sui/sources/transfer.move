@@ -200,7 +200,9 @@ module cashmere_cctp::transfer {
                 recipient,
             ),
             DepositInfo {
-                initial_amount: usdc_value,
+                // The bridged amount is usdc_value minus the fee split off above,
+                // not usdc_value itself (matches CashmereTransfer on other chains).
+                initial_amount: usdc_value - usdc_fee_amount,
                 solana_owner,
                 user: ctx.sender(),
                 gas_drop_amount,
