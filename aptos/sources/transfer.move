@@ -206,13 +206,17 @@ module cashmere_cctp::transfer {
         let cctp_nonce = deposit_for_burn(sender, usdc_asset, destination_domain, recipient);
         config.nonce += 1;
 
+        // The amount actually bridged (and passed to deposit_for_burn above) is the
+        // gross usdc_amount minus the fee taken out above, not usdc_amount itself.
+        let bridged_amount = usdc_amount - usdc_fee_amount;
+
         0x1::event::emit(CashmereTransfer {
             destination_domain,
             nonce: config.nonce,
             recipient,
             solana_owner,
             user: signer::address_of(sender),
-            amount: usdc_amount,
+            amount: bridged_amount,
             gas_drop_amount,
             fee_is_native,
             cctp_nonce: cctp_nonce as u256,
