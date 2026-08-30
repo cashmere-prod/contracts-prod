@@ -18,6 +18,13 @@ module cashmere_cctp::transfer {
 
     const BP: u64 = 10000;
     const MAX_FEE_BP: u64 = 100; // 1%
+    /// CCTP domain identifier of Sui. Previously hardcoded inline at the signature site,
+    /// where it could drift out of step with the backend without any compiler help.
+    const LOCAL_DOMAIN: u32 = 8;
+    /// Highest CCTP domain identifier accepted by this module.
+    const MAX_DOMAIN: u32 = 32;
+    /// Byte length of an ed25519 public key.
+    const ED25519_PUBLIC_KEY_LENGTH: u64 = 32;
 
     const E_WRONG_SIGNATURE: u64 = 0x1000;
     const E_DEADLINE_EXPIRED: u64 = 0x1001;
@@ -26,6 +33,12 @@ module cashmere_cctp::transfer {
     const E_NATIVE_FEE_TOO_LOW: u64 = 0x1004;
     const E_DUPLICATE_NONCE: u64 = 0x1005;
     const E_PAUSED: u64 = 0x1006;
+    const E_INVALID_DOMAIN: u64 = 0x1007;
+    const E_ZERO_AMOUNT: u64 = 0x1008;
+    const E_INVALID_SIGNER_KEY: u64 = 0x1009;
+    const E_ZERO_ADDRESS: u64 = 0x100A;
+
+    const E_MAX_FEE_BP_EXCEEDED: u64 = 0x2000;
 
     public struct AdminCap has key, store {
         id: UID
@@ -44,13 +57,28 @@ module cashmere_cctp::transfer {
         paused: bool,
     }
 
-    // Parameters that ARE INCLUDED in backend signature (gas_on_destination is **not** signed)
+    /// The payload the backend signs to authorize a single transfer.
+    ///
+    /// Every field that decides where the value goes, how much of it moves, and what the
+    /// user is charged is bound in. The previous version covered only the two domains, the
+    /// flat `fee`, the `deadline` and `fee_is_native`, so a signature broadcast once could be
+    /// reused by anybody for a different `usdc_amount`, `recipient` and `gas_drop_amount`.
+    ///
+    /// NOTE: changing this struct changes the bytes the backend signer service must sign.
+    /// The signer service has to be updated in lockstep with this module.
     public struct TransferParams has drop, copy {
         local_domain: u32,
         destination_domain: u32,
         fee: u64,
         deadline: u64,
         fee_is_native: bool,
+        /// Account authorized to spend this quote.
+        sender: address,
+        /// Gross USDC amount pulled from the user, before fees.
+        usdc_amount: u64,
+        recipient: address,
+        solana_owner: address,
+        gas_drop_amount: u64,
     }
 
     /// Unified event format across chains
@@ -66,7 +94,12 @@ module cashmere_cctp::transfer {
         cctp_nonce: u256,
     }
 
-    public struct DepositInfo has drop {
+    /// Receipt tying a prepared burn ticket to the metadata needed for the transfer event.
+    ///
+    /// Deliberately has no `drop`: it can only be consumed by `post_deposit_for_burn`, which
+    /// records the CCTP nonce and emits `CashmereTransfer`. With `drop` a caller could
+    /// discard it and complete a burn that this module never accounted for or announced.
+    public struct DepositInfo {
         initial_amount: u64,
         solana_owner: address,
         user: address,
@@ -99,19 +132,24 @@ module cashmere_cctp::transfer {
     }
 
     public fun set_fee_bp(_: &AdminCap, config: &mut Config, fee_bp: u64) {
-        assert!(fee_bp <= MAX_FEE_BP, 0x2000);
+        assert!(fee_bp <= MAX_FEE_BP, E_MAX_FEE_BP_EXCEEDED);
         config.fee_bp = fee_bp;
     }
 
     public fun set_signer_key(_: &AdminCap, config: &mut Config, signer_key: vector<u8>) {
+        // `ed25519_verify` silently returns false for a wrong-length key, which would brick
+        // every transfer with an indistinguishable "wrong signature" error.
+        assert!(signer_key.length() == ED25519_PUBLIC_KEY_LENGTH, E_INVALID_SIGNER_KEY);
         config.signer_key = signer_key;
     }
 
     public fun set_fee_collector(_: &AdminCap, config: &mut Config, fee_collector: address) {
+        assert!(fee_collector != @0x0, E_ZERO_ADDRESS);
         config.fee_collector = fee_collector;
     }
 
     public fun set_gas_drop_collector(_: &AdminCap, config: &mut Config, gas_drop_collector: address) {
+        assert!(gas_drop_collector != @0x0, E_ZERO_ADDRESS);
         config.gas_drop_collector = gas_drop_collector;
     }
 
@@ -158,8 +196,16 @@ module cashmere_cctp::transfer {
         };
 
         let usdc_value = usdc_coin.value();
+        assert!(usdc_value > 0, E_ZERO_AMOUNT);
+        // A domain this module cannot reach, or Sui's own domain, would burn the USDC with no
+        // remote messenger able to mint it back.
+        assert!(destination_domain < MAX_DOMAIN, E_INVALID_DOMAIN);
+        assert!(destination_domain != LOCAL_DOMAIN, E_INVALID_DOMAIN);
+
         let usdc_fee_amount = get_fee(config, usdc_value, if (fee_is_native) { 0 } else { fee });
-        assert!(usdc_fee_amount <= usdc_value, E_FEE_EXCEEDS_AMOUNT);
+        // Strict comparison: an equal fee would leave nothing to bridge and CCTP rejects a
+        // zero-amount burn with an opaque error.
+        assert!(usdc_fee_amount < usdc_value, E_FEE_EXCEEDS_AMOUNT);
 
         if (fee_is_native) {
             assert!(gas_drop_amount <= config.max_native_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
@@ -168,11 +214,16 @@ module cashmere_cctp::transfer {
         };
 
         let msg_struct = TransferParams {
-            local_domain: 8,
+            local_domain: LOCAL_DOMAIN,
             destination_domain,
             fee,
             deadline,
             fee_is_native,
+            sender: ctx.sender(),
+            usdc_amount: usdc_value,
+            recipient,
+            solana_owner,
+            gas_drop_amount,
         };
         let msg = bcs::to_bytes(&msg_struct);
         assert!(ed25519::ed25519_verify(&signature, &config.signer_key, &msg), E_WRONG_SIGNATURE);
@@ -192,6 +243,11 @@ module cashmere_cctp::transfer {
         // return native change
         transfer::public_transfer(native_fee_coin, ctx.sender());
 
+        // Amount actually handed to CCTP, i.e. net of the USDC fee and of any USDC-denominated
+        // gas drop. The receipt previously carried the pre-fee value, so the emitted event did
+        // not match what the destination chain mints.
+        let bridged_amount = usdc_coin.value();
+
         (
             create_deposit_for_burn_ticket<T, Auth>(
                 auth,
@@ -200,7 +256,7 @@ module cashmere_cctp::transfer {
                 recipient,
             ),
             DepositInfo {
-                initial_amount: usdc_value,
+                initial_amount: bridged_amount,
                 solana_owner,
                 user: ctx.sender(),
                 gas_drop_amount,
@@ -215,6 +271,16 @@ module cashmere_cctp::transfer {
         deposit_info: DepositInfo,
         config: &mut Config,
     ) {
+        // `DepositInfo` has no `drop`, so it is destructured here. This is the only way to
+        // consume it, which is what forces every prepared burn through this accounting step.
+        let DepositInfo {
+            initial_amount,
+            solana_owner,
+            user,
+            gas_drop_amount,
+            fee_is_native,
+        } = deposit_info;
+
         // should abort on duplicate nonce
         // required because BurnMessage and Message are copyable
         assert!(!config.processed_cctp_nonces.contains(message.nonce()), E_DUPLICATE_NONCE);
@@ -224,11 +290,11 @@ module cashmere_cctp::transfer {
             destination_domain: message.destination_domain(),
             nonce: config.nonce,
             recipient: burn_message.mint_recipient(),
-            solana_owner: deposit_info.solana_owner,
-            user: deposit_info.user,
-            amount: deposit_info.initial_amount,
-            gas_drop_amount: deposit_info.gas_drop_amount,
-            fee_is_native: deposit_info.fee_is_native,
+            solana_owner,
+            user,
+            amount: initial_amount,
+            gas_drop_amount,
+            fee_is_native,
             cctp_nonce: message.nonce() as u256,
         });
     }
@@ -239,11 +305,16 @@ module cashmere_cctp::transfer {
     #[test]
     fun test_signature() {
         let msg_struct = TransferParams {
-            local_domain: 8,
+            local_domain: LOCAL_DOMAIN,
             destination_domain: 1,
             fee: 2,
             deadline: 3,
             fee_is_native: false,
+            sender: @0x1,
+            usdc_amount: 1_000_000,
+            recipient: @0x2,
+            solana_owner: @0x3,
+            gas_drop_amount: 0,
         };
         let msg = bcs::to_bytes(&msg_struct);
         debug::print(&msg);
