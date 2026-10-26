@@ -12,7 +12,7 @@ pub const MESSAGE_TRANSMITTER_V2_PROGRAM_ID: Pubkey =
 pub const TOKEN_MESSENGER_MINTER_V2_PROGRAM_ID: Pubkey =
     pubkey!("CCTPV2vPZJS2u2BBsUoscuikbYjnpFmbFsvVuJdgUMQe");
 pub const USDC_MINT: Pubkey =
-    pubkey!("4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU");
+    pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
 #[macro_export]
 macro_rules! impl_anchor_account_readonly {

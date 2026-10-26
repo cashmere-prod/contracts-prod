@@ -11,11 +11,18 @@ module cashmere_cctp::transfer {
     use aptos_framework::coin;
     use aptos_framework::coin::Coin;
     use token_messenger_minter::token_messenger::deposit_for_burn;
+    use token_messenger_minter_v2::token_messenger_minter as cctp_v2;
+    use stablecoin_handler::handler as cctp_v2_handler;
 
     const SEED_NAME: vector<u8> = b"CASHMERE_CCTP_CONFIG";
     const BP: u64 = 10000;
     const MAX_FEE_BP: u64 = 100;
     const LOCAL_DOMAIN: u32 = 9;
+    // version byte the gas API puts in front of the transfer params for V2 (`version=2`)
+    const CCTP_VERSION_2: u8 = 2;
+    // Circle assigns V2 nonces when it attests the burn, so the event carries 0 like the V2
+    // message itself; off-chain code finds the message by transaction hash
+    const CCTP_V2_NONCE: u256 = 0;
 
     const E_WRONG_SIGNATURE: u64 = 0x1000;
     const E_DEADLINE_EXPIRED: u64 = 0x1001;
@@ -41,6 +48,16 @@ module cashmere_cctp::transfer {
     }
 
     struct TransferParams has drop, copy {
+        local_domain: u32,
+        destination_domain: u32,
+        fee: u64,
+        deadline: u64,
+        fee_is_native: bool,
+    }
+
+    // TransferParams behind the CCTP version, so a signature for one version fails on the other
+    struct TransferParamsV2 has drop, copy {
+        cctp_version: u8,
         local_domain: u32,
         destination_domain: u32,
         fee: u64,
@@ -257,10 +274,146 @@ module cashmere_cctp::transfer {
         )
     }
 
+    // Same as `transfer` except for the signed params, the burn (Circle's V2 deposit_for_burn,
+    // completed by the USDC handler) and the cctp_nonce in the event
+    public fun transfer_v2(
+        sender: &signer,
+        usdc_asset: FungibleAsset,
+        native_fee: Coin<0x1::aptos_coin::AptosCoin>,
+        destination_domain: u32,
+        recipient: address,
+        solana_owner: address,
+        fee: u64,
+        deadline: u64,
+        gas_drop_amount: u64,
+        fee_is_native: bool,
+        max_fee: u64,
+        min_finality_threshold: u32,
+        signature: vector<u8>
+    ) acquires Config {
+        let gas_drop_native = if (gas_drop_amount > 0 && fee_is_native) {
+            coin::extract(&mut native_fee, gas_drop_amount)
+        } else {
+            coin::zero<0x1::aptos_coin::AptosCoin>()
+        };
+        let gas_drop_usdc = if (gas_drop_amount > 0 && !fee_is_native) {
+            fungible_asset::extract(&mut usdc_asset, gas_drop_amount)
+        } else {
+            let metadata = aptos_framework::object::address_to_object<aptos_framework::fungible_asset::Metadata>(@usdc);
+            fungible_asset::zero(metadata)
+        };
+
+        let usdc_amount = fungible_asset::amount(&usdc_asset);
+        let usdc_fee_amount = get_fee(usdc_amount, if (fee_is_native) { 0 } else { fee });
+        assert!(usdc_amount >= usdc_fee_amount, E_FEE_EXCEEDS_AMOUNT);
+
+        let config: &mut Config = borrow_global_mut(get_object_address());
+        assert!(!config.paused, E_PAUSED);
+        if (fee_is_native) {
+            assert!(gas_drop_amount <= config.max_native_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
+        } else {
+            assert!(gas_drop_amount <= config.max_usdc_gas_drop, E_GAS_DROP_LIMIT_EXCEEDED);
+        };
+
+        let msg_struct = TransferParamsV2 {
+            cctp_version: CCTP_VERSION_2,
+            local_domain: LOCAL_DOMAIN,
+            destination_domain,
+            fee,
+            deadline,
+            fee_is_native,
+        };
+        let msg = bcs::to_bytes(&msg_struct);
+        assert!(ed25519::signature_verify_strict(&ed25519::new_signature_from_bytes(signature), &config.signer_key, msg), E_WRONG_SIGNATURE);
+        assert!(deadline >= timestamp::now_seconds(), E_DEADLINE_EXPIRED);
+
+        if (usdc_fee_amount > 0) {
+            let fee_asset = fungible_asset::extract(&mut usdc_asset, usdc_fee_amount);
+            primary_fungible_store::deposit(config.fee_collector, fee_asset);
+        };
+        primary_fungible_store::deposit(config.gas_drop_collector, gas_drop_usdc);
+        coin::deposit(config.gas_drop_collector, gas_drop_native);
+        if (fee_is_native) {
+            assert!(coin::value(&native_fee) >= fee, E_NATIVE_FEE_TOO_LOW);
+            let fee_coin = coin::extract(&mut native_fee, fee);
+            coin::deposit(config.fee_collector, fee_coin);
+        };
+        // return native change; should handle zero coin
+        coin::deposit(signer::address_of(sender), native_fee);
+
+        // destination caller 0x0: anyone can mint on the destination, as with V1
+        let (burn_receipt, burn_asset) = cctp_v2::deposit_for_burn(
+            sender,
+            usdc_asset,
+            destination_domain,
+            recipient,
+            @0x0,
+            max_fee,
+            min_finality_threshold,
+            vector[],
+        );
+        cctp_v2_handler::burn(burn_receipt, burn_asset);
+        config.nonce += 1;
+
+        0x1::event::emit(CashmereTransfer {
+            destination_domain,
+            nonce: config.nonce,
+            recipient,
+            solana_owner,
+            user: signer::address_of(sender),
+            amount: usdc_amount,
+            gas_drop_amount,
+            fee_is_native,
+            cctp_nonce: CCTP_V2_NONCE,
+        });
+    }
+
+    // Arguments of `transfer_outer` with the V2 burn params before the signature; the relayer
+    // reads the fee at argument index 5, so that position must not move
+    public entry fun transfer_v2_outer(
+        sender: &signer,
+        usdc_amount: u64,
+        native_amount: u64,
+        destination_domain: u32,
+        recipient: address,
+        solana_owner: address,
+        fee: u64,
+        deadline: u64,
+        gas_drop_amount: u64,
+        fee_is_native: bool,
+        max_fee: u64,
+        min_finality_threshold: u32,
+        signature: vector<u8>
+    ) acquires Config {
+        let metadata = aptos_framework::object::address_to_object<aptos_framework::fungible_asset::Metadata>(@usdc);
+        let usdc_amount = usdc_amount + if (fee_is_native) { 0 } else { gas_drop_amount };
+        let usdc_asset = aptos_framework::primary_fungible_store::withdraw(sender, metadata, usdc_amount);
+
+        let native_fee = if (fee_is_native && native_amount > 0) {
+            coin::withdraw<0x1::aptos_coin::AptosCoin>(sender, native_amount)
+        } else {
+            coin::zero<0x1::aptos_coin::AptosCoin>()
+        };
+
+        transfer_v2(
+            sender,
+            usdc_asset,
+            native_fee,
+            destination_domain,
+            recipient,
+            solana_owner,
+            fee,
+            deadline,
+            gas_drop_amount,
+            fee_is_native,
+            max_fee,
+            min_finality_threshold,
+            signature,
+        )
+    }
+
     #[test_only]
     use aptos_std::debug;
-    #[test_only]
-    use std::bcs;
     #[test_only]
     use aptos_std::type_info;
 
@@ -270,5 +423,30 @@ module cashmere_cctp::transfer {
         let type_info = type_info::type_of<TransferParams>();
         let encoded = bcs::to_bytes(&type_info);
         debug::print(&encoded);
+    }
+
+    #[test]
+    fun transfer_params_v2_is_version_byte_then_v1_params() {
+        let v1 = TransferParams { local_domain: LOCAL_DOMAIN, destination_domain: 6, fee: 190000, deadline: 1793005550, fee_is_native: false };
+        let v2 = TransferParamsV2 { cctp_version: CCTP_VERSION_2, local_domain: LOCAL_DOMAIN, destination_domain: 6, fee: 190000, deadline: 1793005550, fee_is_native: false };
+        let expected = vector[CCTP_VERSION_2];
+        std::vector::append(&mut expected, bcs::to_bytes(&v1));
+        assert!(bcs::to_bytes(&v2) == expected, 0);
+    }
+
+    // message and signature returned by gas.cashmere.exchange/getEd25519Sig_native?localDomain=9
+    // &destinationDomain=6&isNative=false&version=2 on 2026-10-26; the key is the signer_key in
+    // the mainnet Config
+    #[test]
+    fun gas_api_v2_signature_verifies_only_on_v2_params() {
+        let v2_msg = bcs::to_bytes(&TransferParamsV2 { cctp_version: CCTP_VERSION_2, local_domain: LOCAL_DOMAIN, destination_domain: 6, fee: 190000, deadline: 1793005550, fee_is_native: false });
+        assert!(v2_msg == x"02090000000600000030e6020000000000ee17df6a0000000000", 0);
+
+        let signer_key = ed25519::new_unvalidated_public_key_from_bytes(x"a72bce6ad6443b4f3fc41adb9b68a2e0696a67662f6cc7f70e86f31d93f50280");
+        let signature = ed25519::new_signature_from_bytes(x"84c1e26e4e7900436a60911b846aa3e149e0f318075765e6586b84fbf77f64158130f00d83d06c0de6c3e35ce12fb1b280644153a1fa689b286051b638bb7505");
+        assert!(ed25519::signature_verify_strict(&signature, &signer_key, v2_msg), 1);
+
+        let v1_msg = bcs::to_bytes(&TransferParams { local_domain: LOCAL_DOMAIN, destination_domain: 6, fee: 190000, deadline: 1793005550, fee_is_native: false });
+        assert!(!ed25519::signature_verify_strict(&signature, &signer_key, v1_msg), 2);
     }
 }
