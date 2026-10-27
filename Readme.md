@@ -16,6 +16,12 @@ Cashmere CCTP is a comprehensive multi-chain solution that allows users to trans
 - **Aptos** - Aptos mainnet and testnet  
 - **Sui** - Sui mainnet and testnet
 
+### Goat LP
+
+This repository also holds the source of the Goat LP contracts on Robinhood Chain (chain ID 4663): compounding,
+auto-range and auto-exit for Uniswap v3 and v4 positions. See [goat-lp/README.md](goat-lp/README.md) for the
+contracts, their addresses, build settings and licences.
+
 ## ✨ Features
 
 - 🔄 **Cross-Chain USDC Transfers** - Seamlessly transfer USDC between different blockchain networks
