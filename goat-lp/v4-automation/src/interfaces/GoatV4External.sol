@@ -111,22 +111,24 @@ interface IGoatFeeCapHook {
     function currentFee(bytes32 poolId, bool zeroForOne) external view returns (uint24);
 }
 
-/// @notice `GoatV4PokeOracle.consult` window. Medians are taken over the existing buckets of the last 15 COMPLETE 60 s
+/// @notice `GoatV4PokeOracle.consult` window. Medians are taken over the REGISTERED buckets of the last 15 COMPLETE 60 s
 ///         slots (the current slot excluded); the `complete` / `registered` counters serve the consumer's 15/15 rule.
+///         Pokes by unregistered callers are not part of any field (they only feed the oracle's monitoring views).
 struct PokeWindow {
-    uint16 complete; // number of buckets in slots k = 1..15 whose start is exactly that slot
-    uint16 registered; // how many of them a registered poker touched
+    uint16 complete; // number of registered buckets in slots k = 1..15 whose start is exactly that slot
+    uint16 registered; // the same number in `consult` (both kept for interface compatibility)
     int24 medLo; // lower median of the bucket lo values
     int24 medHi; // lower median of the bucket hi values
     int24 medMid; // lower median of floor((lo + hi) / 2)
     int24 spreadMax; // LOWER median of bucket hi − lo (name kept for compatibility; NOT the widest)
     int24 newLo; // smallest lo of the newest buckets (slot 1 and, if present, slot 0)
     int24 newHi; // largest hi of the newest buckets
-    uint128 minL; // smallest in-range liquidity seen by REGISTERED pokes in the window (0 without a registered bucket)
+    uint128 minL; // smallest in-range liquidity seen by registered pokes in the window (0 without a bucket)
     uint32 age; // now − start of the newest existing bucket
 }
 
-/// @notice The one view the registry reads from the poke oracle.
+/// @notice The one view the registry and the meter read from the poke oracle (registered pokes only). The oracle's
+///         monitoring views (`consultAll`, `openBucketAt`) are deliberately NOT part of this interface.
 interface IGoatPokeOracle {
     function consult(bytes32 poolId) external view returns (PokeWindow memory w);
 }
@@ -139,6 +141,21 @@ interface IGoatSourceMeter {
         external
         view
         returns (PairEntry memory, NcSource memory);
+    /// @notice `validateCl` / `validateNc` plus the measured source depth (USD): the registry's depth at listing.
+    function measureCl(address c0, address c1, PairConfig calldata cfg)
+        external
+        view
+        returns (PairEntry memory, uint256 srcUsd);
+    function measureNc(address c0, address c1, NcPairConfig calldata cfg)
+        external
+        view
+        returns (PairEntry memory, NcSource memory, uint256 srcUsd);
+    /// @notice Live source depth (USD) of a stored row with a v3 source, exact below $4,000 (a Chainlink-priced source
+    ///         proven to hold at least that returns $4,000); `type(uint256).max` for other kinds.
+    function liveSourceUsd(address c0, address c1, PairEntry calldata e, NcSource calldata n)
+        external
+        view
+        returns (uint256);
     /// @notice Depth rule: the pool's ±100-tick walk (raw token units: token0 in going down, token1 in going up).
     function v4Depth(bytes32 poolId, int24 ts) external view returns (uint256 down0, uint256 up1, uint128 lNow);
 }

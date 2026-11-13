@@ -20,7 +20,8 @@ library GoatV4Constants {
     /// @dev Uniswap v3 factory (4663); a source pool's identity is confirmed with `getPool`. Enabled fee tiers 100/500/3000/10000.
     address internal constant V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA;
 
-    /// @dev Gate G is set per pair in `GoatV4PairRegistry` (100 in the founding ETH/USDG entry).
+    /// @dev Gate G is set per pair in `GoatV4PairRegistry`, from GATE_MIN to GATE_MAX ticks (100 in the founding
+    ///      ETH/USDG entry).
 
     /// @dev The PoolManager protocol fee can be at most 1000 pips (0.1%) per direction. The floor ALWAYS deducts this
     ///      share; it is not read in the transaction (general floor policy).
@@ -49,9 +50,9 @@ library GoatV4Constants {
     /// @dev Upper bound of a user-signed max swap fee (100,000 pips = 10 %); kinds 3 / 4 clamp `feeCeiling` to it. Read by
     ///      the registry (entry ceilings) and the Steward (`maxSwapFeePips`).
     uint24 internal constant MAX_USER_SWAP_FEE = 100_000;
-    /// @dev An entry pool needs a ±100-tick walk AND a listed `fillUsd` of at least $4,000 at queue, apply and seed. The
-    ///      same value as `MIN_SOURCE_DEPTH_USD`.
-    uint32 internal constant ENTRY_MIN_WALK_USD = 4_000;
+    /// @dev An entry pool needs a ±100-tick walk AND a listed `fillUsd` of at least $1,000 at queue, apply and seed. A
+    ///      thin entry pool fails closed at run time (the Engine refuses a partial fill and a floor miss).
+    uint32 internal constant ENTRY_MIN_WALK_USD = 1_000;
     /// @dev Kind 4: the only admitted PonsV2MemeHook runtime.
     bytes32 internal constant KIND4_CODEHASH = 0xc21b1e6c1b45403e81a581f22ed6d9c747997af1cfdac1b1dc9f4b1d346a10db;
     /// @dev Kind 4: `launches(bytes32)` of the pinned runtime, read with a fixed gas stipend; the record is 13 ABI words
@@ -71,17 +72,21 @@ library GoatV4Constants {
     bytes32 internal constant RED_FOUNDING_CODEHASH_B = 0xa0a51b6d7da272dc55d59176390a3df328612bd4c006a4cda944879021f78e61;
 
     // ---------------------------------------------------------------- pair table and meter (shared by both)
-    int24 internal constant GATE_MIN = 100;
+    int24 internal constant GATE_MIN = 50;
     int24 internal constant GATE_MAX = 140;
     int24 internal constant VETO_TICKS_MAX = 300;
     uint32 internal constant MIN_FEED_AGE = 1 hours;
     uint32 internal constant MAX_FEED_AGE = 25 hours;
+    /// @dev The USDG/USD feed (`USDG_USD_FEED`) updates on a 24-hour heartbeat: a feed rule on exactly that feed may be
+    ///      listed with a `maxAge` up to 30 h. Every other feed keeps `MAX_FEED_AGE`.
+    uint32 internal constant MAX_FEED_AGE_USDG = 30 hours;
     uint64 internal constant BAD_ROUND_CEILING = 1_000_000e8;
     uint8 internal constant MAX_TOKEN_DECIMALS = 30;
     uint256 internal constant MAX_POOLS = 8;
     /// @dev Exec-pool floor (whole USD): every listed pool needs a declared `fillUsd` >= this value and a measured
-    ///      ±100-tick walk >= this value (meter `_checkPoolsShape` / `_checkExecPools`, `R_POOL_WALK`).
-    uint32 internal constant MIN_POOL_FILL_USD = 500;
+    ///      ±100-tick walk >= this value (meter `_checkPoolsShape` / `_checkExecPools`, `R_POOL_WALK`). A thin exec pool
+    ///      fails closed at run time (`PartialFill` at anchor ∓ G, plus the floor).
+    uint32 internal constant MIN_POOL_FILL_USD = 250;
     /// @dev Source TWAP windows and the extreme-price bound (|tick| <= NC_MAX_ABS_TICK).
     uint32 internal constant VETO_WINDOW = 900;
     uint32 internal constant GATE_TWAP_SLOW = 60;
@@ -91,9 +96,19 @@ library GoatV4Constants {
     int24 internal constant VD4_TICKS = 100;
     uint32 internal constant VD4_TW_WINDOW = 1800;
     uint256 internal constant MAX_WALK_TICKS = 256;
-    /// @dev Source depth floor (USD): a V3 / POKE source's VD4, or a CL_V3DERIVED path's min(VD50_1, VD50_2, H). VD4 is
-    ///      the only depth rule.
-    uint256 internal constant MIN_SOURCE_DEPTH_USD = 4_000;
+    /// @dev Source depth floors (USD) at listing: a V3 / POKE source's VD4, or a CL_V3DERIVED path's
+    ///      min(VD50_1, VD50_2, H). Chainlink-priced rows with a v3 source (CL_V3, CL_V3DERIVED): $1,000; rows without
+    ///      Chainlink with a v3 source (NC_V3SAME, NC_V3DERIVED): $2,000; POKE sources (CL_POKE, NC_POKE): $4,000.
+    uint256 internal constant MIN_CL_SOURCE_DEPTH_USD = 1_000;
+    uint256 internal constant MIN_NC_SOURCE_DEPTH_USD = 2_000;
+    uint256 internal constant MIN_POKE_SOURCE_DEPTH_USD = 4_000;
+    /// @dev Depth room of a row with a v3 source (kinds 1, 3, 4, 6): with D = min(source depth at listing, live source
+    ///      depth), operator swap flows of the pair move at most D x DEPTH_ROOM_BPS / 10,000 (USD, valued at the anchor)
+    ///      per DEPTH_ROOM_WINDOW seconds (a leaky bucket) while D < FULL_SIZE_DEPTH_USD; at or above it there is no such
+    ///      limit. The owner's own runs are not counted, and withdraw-only exits never are.
+    uint256 internal constant FULL_SIZE_DEPTH_USD = 4_000;
+    uint256 internal constant DEPTH_ROOM_BPS = 2_500;
+    uint256 internal constant DEPTH_ROOM_WINDOW = 900;
     /// @dev A pre-filter, NOT a guarantee: with at most one observation per second N slots cover only N − 1 s, so a ring
     ///      of 1,800 does not always satisfy `observe(VD4_TW_WINDOW = 1800)`. The binding check is the meter's own
     ///      `observe([1800, 900, 60, 10, 0])` call (try/catch -> `SourceUnusable(R_OBSERVE)`, fail-closed, only at

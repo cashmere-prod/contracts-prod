@@ -21,7 +21,7 @@ import "../lib/GoatV4Errors.sol";
 /**
  * @notice Abstract base of `GoatV4Steward`: roles, timelocks, pause, fees, hourly buckets (off by default), retirement,
  *         and the gate / pool-rule primitives. The anchor, the source checks, the pair scope and the hook entries live
- *         in the separate `GoatV4PairRegistry` (per-pair feeds, gate G and price sources; listing waits 24 h, removal
+ *         in the separate `GoatV4PairRegistry` (per-pair feeds, gate G and price sources; listing waits 1 h, removal
  *         is immediate).
  *
  * @dev There is no per-position cap. The global hourly limit is off by default; the owner can turn it on later.
@@ -66,8 +66,8 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
     uint8 internal constant KIND_EXTERNAL_VENUE = 2;
     uint8 internal constant KIND_CONST_TAX = 3;
 
-    uint256 internal constant TIMELOCK = 24 hours;
-    /// @notice A queued action can be applied in [queuedAt + TIMELOCK, queuedAt + TIMELOCK + QUEUE_GRACE] (24 h, then a
+    uint256 internal constant TIMELOCK = 1 hours;
+    /// @notice A queued action can be applied in [queuedAt + TIMELOCK, queuedAt + TIMELOCK + QUEUE_GRACE] (1 h, then a
     ///         7-day window, both bounds inclusive); after that it expires.
     uint256 internal constant QUEUE_GRACE = 7 days;
 
@@ -125,7 +125,7 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
     /// @notice Hourly buckets: [0] RECENTER, [1] swap EXIT. Capacity 0 = limit off (the default).
     GoatRateBucket.Bucket[2] internal _buckets;
     /// @notice Per-kind epoch in the bucket-raise queue id. Every immediate tightening (`lowerBucket`) bumps it, so a
-    ///         loosening queued before the tightening needs a fresh 24-hour notice (the same pattern as `pauseEpoch`).
+    ///         loosening queued before the tightening needs a fresh 1-hour notice (the same pattern as `pauseEpoch`).
     uint64[2] internal _bucketEpoch;
 
     // Hook entries (storage, queue / apply / remove, validation) live in the REGISTRY, which also emits their events;
@@ -196,7 +196,7 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
         eta = block.timestamp + TIMELOCK;
     }
 
-    /// @dev Consumes a queued action: the 24 h TIMELOCK has elapsed and the 7-day QUEUE_GRACE after it has not.
+    /// @dev Consumes a queued action: the 1 h TIMELOCK has elapsed and the 7-day QUEUE_GRACE after it has not.
     function _consume(bytes32 id) internal {
         uint256 t = queuedAt[id];
         if (t == 0) revert NotQueued();
@@ -209,7 +209,7 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
         return keccak256(abi.encode("OPERATOR", op));
     }
 
-    /// @notice Adding an operator waits for the 24-hour timelock.
+    /// @notice Adding an operator waits for the 1-hour timelock.
     function queueOperator(address op) external onlyOwner nonReentrant {
         if (op == address(0)) revert BadValue();
         emit OperatorQueued(op, _queue(_operatorId(op)));
@@ -233,14 +233,14 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
         return keccak256(abi.encode("GUARDIAN", guardian, g));
     }
 
-    /// @notice Replacing or removing (`g == 0`) a live guardian waits for the 24-hour timelock; the current guardian
+    /// @notice Replacing or removing (`g == 0`) a live guardian waits for the 1-hour timelock; the current guardian
     ///         keeps its pause power until `setGuardian(g)` applies the change.
     function queueGuardian(address g) external onlyOwner nonReentrant {
         emit GuardianQueued(g, _queue(_guardianId(g)));
     }
 
     /// @notice With no guardian set: instant (it only adds a pause veto). Otherwise applies a `queueGuardian(g)` entry
-    ///         (24 h elapsed, within the 7-day grace) made while the current guardian was in place.
+    ///         (1 h elapsed, within the 7-day grace) made while the current guardian was in place.
     function setGuardian(address g) external onlyOwner nonReentrant {
         if (guardian != address(0)) _consume(_guardianId(g));
         guardian = g;
@@ -261,7 +261,7 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
         return keccak256(abi.encode("UNPAUSE", mask, pauseEpoch));
     }
 
-    /// @notice Unpausing waits for the 24-hour timelock. Any pause in between voids the queue entry.
+    /// @notice Unpausing waits for the 1-hour timelock. Any pause in between voids the queue entry.
     function queueUnpause(uint8 mask) external onlyOwner nonReentrant {
         if (mask == 0 || mask > 7) revert BadValue();
         emit UnpauseQueued(mask, _queue(_unpauseId(mask)));
@@ -299,7 +299,7 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
         emit BucketLowered(kind, usd8);
     }
 
-    /// @notice LOOSENING, 24-hour timelock: raise a bucket that is on, or turn it off (`usd8 == 0`).
+    /// @notice LOOSENING, 1-hour timelock: raise a bucket that is on, or turn it off (`usd8 == 0`).
     function queueBucketRaise(uint256 kind, uint128 usd8) external onlyOwner nonReentrant {
         _raiseCheck(kind, usd8);
         emit BucketRaiseQueued(kind, usd8, _queue(_bucketId(kind, usd8)));
@@ -332,7 +332,7 @@ abstract contract GoatV4StewardCore is Ownable2Step, ReentrancyGuard {
     }
 
     // ------------------------------------------------------------------ hook entries
-    // Queue / apply / remove and `_validateHookEntry` live in `GoatV4PairRegistry` (owner, 24 h; removal by the owner or
+    // Queue / apply / remove and `_validateHookEntry` live in `GoatV4PairRegistry` (owner, 1 h; removal by the owner or
     // the registry guardian, immediate). The Steward only reads: `_poolRule` -> `REGISTRY.ruleOf`, `_hookFeeGuard` at run time.
 
     /// @notice One-way retirement: new configs and all runs revert for good; clearing a config stays possible.

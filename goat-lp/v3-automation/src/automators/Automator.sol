@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Modified by Goat for Robinhood Chain; Goat's changes are commented with "Goat:".
 // Source: revert-finance/lend@7e85a81 src/automators/Automator.sol.
-// Main changes: Pausable with a guardian; a 24 h timelock for adding operators, unpausing and replacing the guardian
+// Main changes: Pausable with a guardian; a 1 h timelock for adding operators, unpausing and replacing the guardian
 // (a queued entry lapses 7 days after its eta); ReentrancyGuard on every state-changing external entry point, with the
 // authorization check first; setTWAPConfig split into a virtual wrapper and an internal function; collects go through
 // _collectExact (the reported amount must match the balance change, up to 2 wei of share rounding); fee withdrawals
@@ -41,7 +41,7 @@ abstract contract Automator is Ownable2Step, Swapper, Pausable, ReentrancyGuard 
     event OperatorQueued(address indexed operator, uint256 eta);
     event GuardianChanged(address newGuardian);
     event UnpauseQueued(uint256 eta);
-    // Goat: an owner replacement of the guardian is queued (24 h, owner-only queue); eta 0 = queue cleared (cancelled,
+    // Goat: an owner replacement of the guardian is queued (1 h, owner-only queue); eta 0 = queue cleared (cancelled,
     // consumed or overridden). Same signature and indexing as GoatPairTable.GuardianQueued (one ABI decodes both)
     event GuardianQueued(address newGuardian, uint256 eta);
     // Goat: fee withdrawals emit an event (token address(0) = native ETH)
@@ -56,7 +56,7 @@ abstract contract Automator is Ownable2Step, Swapper, Pausable, ReentrancyGuard 
 
     // Goat: adding an operator and unpausing wait TIMELOCK; pausing (owner or guardian) and removing an operator are
     // instant
-    uint256 public constant TIMELOCK = 24 hours;
+    uint256 public constant TIMELOCK = 1 hours;
     // Goat: a queued entry can be applied until eta + QUEUE_GRACE (inclusive); later it reverts with NotQueued
     uint256 public constant QUEUE_GRACE = 7 days;
     // Goat: the amount collect delivers may be at most this much below the amount it reports (share rounding of
@@ -460,6 +460,24 @@ abstract contract Automator is Ownable2Step, Swapper, Pausable, ReentrancyGuard 
         } else {
             SafeERC20.safeTransfer(token, to, amount);
         }
+    }
+
+    // Goat: a permit for this contract did not leave it allowed for the position
+    error PermitNotApplied();
+
+    // Goat: applies the owner's position-manager permit (per position) for this contract, for configTokenWithPermit.
+    // A permit that cannot be applied (for example one already sent by someone else) is accepted only when this
+    // contract is allowed for the position afterwards; otherwise the call reverts.
+    function _permitSelf(uint256 tokenId, uint256 deadline, uint8 v, bytes32 r, bytes32 s) internal {
+        try nonfungiblePositionManager.permit(address(this), tokenId, deadline, v, r, s) {} catch {}
+        if (!_allowedFor(tokenId, nonfungiblePositionManager.ownerOf(tokenId))) revert PermitNotApplied();
+    }
+
+    // Goat: this contract may move the position: its approval for this position, or the owner's approval for all
+    // positions
+    function _allowedFor(uint256 tokenId, address holder) internal view returns (bool) {
+        return nonfungiblePositionManager.getApproved(tokenId) == address(this)
+            || nonfungiblePositionManager.isApprovedForAll(holder, address(this));
     }
 
     // needed for WETH unwrapping

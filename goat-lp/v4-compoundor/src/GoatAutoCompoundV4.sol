@@ -86,7 +86,7 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
 
     /// @notice Adding an operator waits TIMELOCK and must then be applied within QUEUE_GRACE; removing one
     ///         is instant.
-    uint256 public constant TIMELOCK = 24 hours;
+    uint256 public constant TIMELOCK = 1 hours;
     uint256 public constant QUEUE_GRACE = 7 days;
     /// @notice Queue timestamps. Operator entries are keyed by keccak256(abi.encode(operator, owner at queue time))
     ///         and reviewed-hook entries by keccak256(abi.encode(hook, codehash, owner at queue time)); the
@@ -104,7 +104,7 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
      * @dev A pool without a hook always passes. A pool with a hook passes only if the hook is listed and its live
      * code hash equals the pin (`_requireReviewedHook`, checked in `configToken` and on every run). The list starts
      * empty, so only hookless pools work until a hook is added. The owner (a multisig) manages it with
-     * `setReviewedHook`. Removal is instant; adding or re-pinning waits 24 hours: `queueReviewedHook(hook, codehash)`,
+     * `setReviewedHook`. Removal is instant; adding or re-pinning waits 1 hour: `queueReviewedHook(hook, codehash)`,
      * then `setReviewedHook(hook, codehash)` within [eta, eta + QUEUE_GRACE]. The wait matters because listing a hook
      * lets positions in its pools that already turned automation on run again, so owners have time to react.
      * The pin catches a change of code (a CREATE2 redeploy or a changed 7702 delegation) but not a proxy's
@@ -148,6 +148,10 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
     mapping(uint256 => Config) public configs;
     /// @notice The owner at opt-in time; automation stops by itself when `ownerOf` differs.
     mapping(uint256 => address) public configOwner;
+    /// @notice Owner and nonce pairs (key `keccak256(abi.encode(owner, nonce))`) whose signature already authorized a
+    /// run. A signature authorizes one run: a later run with the same owner and nonce is refused (`PermitRequired`),
+    /// also after the owner gives a plain approval inside the signed deadline.
+    mapping(bytes32 => bool) public permitUsed;
 
     // ------------------------------------------------------------- events
 
@@ -198,7 +202,7 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
     error SlippageZero();
     /// @notice No queued addition for (operator, current owner).
     error NotQueued();
-    /// @notice The 24-hour delay has not passed.
+    /// @notice The 1-hour delay has not passed.
     error TimelockNotReady();
     /// @notice The 7-day window for applying after the delay has passed.
     error TimelockExpired();
@@ -240,7 +244,7 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
         emit GuardianSet(g);
     }
 
-    /// @notice `active = true` applies a matured queue entry of the current owner (24 hours passed, within the
+    /// @notice `active = true` applies a matured queue entry of the current owner (1 hour passed, within the
     ///         7-day grace); `active = false` is instant and also cancels the current owner's queued addition.
     ///         The guardian may only remove (`active = false`).
     function setOperator(address op, bool active) external nonReentrant {
@@ -290,7 +294,7 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
      * designator (0xef0100 followed by an address, 23 bytes), `codehash` equals its live `EXTCODEHASH`, and the
      * address has none of `HOOK_FORBIDDEN_BITS`. The bits are part of the address, so checking them here is
      * enough. Removal is always allowed, also during an ownership handover.
-     * @dev Adding or re-pinning needs a matured queue entry of the current owner (`queueReviewedHook`, 24 hours
+     * @dev Adding or re-pinning needs a matured queue entry of the current owner (`queueReviewedHook`, 1 hour
      * passed, within the 7-day grace) and no pending handover; the entry is used up. Order of checks: rules,
      * handover, queue.
      */
@@ -438,7 +442,8 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
          *    and the per-token approval must be in place at transfer time; `isApprovedForAll` does not count. The
          *    permit is tried first. If it reverts because the same permit was already submitted, the run goes
          *    ahead only when `_bankedPermitValid` accepts it (deadline not passed, signed by the owner, nonce
-         *    used). Without a signature there is no run in this mode (`PermitRequired`).
+         *    used, no earlier run used it). A signature authorizes one run (`permitUsed`). Without a signature
+         *    there is no run in this mode (`PermitRequired`).
          *  - Standing-approval mode: the owner's explicit opt-in. Any existing approval counts, and a signature,
          *    if given, is tried as well. `transferFrom` clears `getApproved[id]` on every run, so with a
          *    per-token `approve` alone this mode runs a single time.
@@ -469,6 +474,8 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
             }
             if (positionManager.getApproved(p.tokenId) != address(this)) revert PermitRequired();
         }
+        // A signature authorizes one run: once it has, the same owner and nonce never authorize another.
+        if (usedPermit) permitUsed[keccak256(abi.encode(owner, p.nonce))] = true;
 
         /**
          * Send the position to the compoundor. With `from = owner`, the compoundor returns the NFT and the
@@ -540,10 +547,13 @@ contract GoatAutoCompoundV4 is Ownable2Step, ReentrancyGuard {
      *      and by other permits with the same nonce, so cancelling a signature takes `revokeNonce` plus clearing
      *      the approval (`approve(address(0), tokenId)`) or `configToken` with `enabled = false`;
      *  (3) the signature is the owner's over the digest the PositionManager checks (`DOMAIN_SEPARATOR`, spender =
-     *      this contract, tokenId, nonce, deadline), by the same rule as permit2's `SignatureVerification`.
+     *      this contract, tokenId, nonce, deadline), by the same rule as permit2's `SignatureVerification`;
+     *  (4) no earlier run used a signature of this owner with this nonce (`permitUsed`), so a spent signature does
+     *      not pass again, also after a plain approval inside its deadline.
      */
     function _bankedPermitValid(ExecuteParams calldata p, address owner) internal view returns (bool) {
         if (p.signature.length == 0 || block.timestamp > p.permitDeadline) return false;
+        if (permitUsed[keccak256(abi.encode(owner, p.nonce))]) return false;
         bytes32 digest = keccak256(
             abi.encodePacked(
                 "\x19\x01",

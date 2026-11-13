@@ -21,16 +21,17 @@ pragma solidity 0.8.26;
  *      feeds whose token has no official Robinhood address (BTC, USDC, USDT and others).
  *
  * @dev The hard-coded address is the proxy; the aggregator behind it can change without an event. The
- *      table can be changed later through `GoatPriceAnchor.queueFeed`, which waits 24 hours.
+ *      table can be changed later through `GoatPriceAnchor.queueFeed`, which waits 1 hour.
  *
  * @dev Stock feeds update 24/5 (Sunday 20:00 ET to Friday 20:00 ET) and keep their last value over the
  *      weekend (see `GoatPriceAnchor.MAX_FEED_AGE`).
  *
  * @dev Every row has a 24-hour heartbeat and a 0.5% deviation threshold; the anchor rejects answers
  *      above `GoatPriceAnchor.MAX_FEED_ANSWER`. For the two rows that update around the clock (WETH and
- *      USDG) the anchor's constructor writes a 25-hour age limit from `initialMaxAge` into `feedMaxAge`,
- *      so it applies from deployment with no queued change. Stock rows keep 0, the 5-day default. Later
- *      changes go through `queueFeedMaxAge`, a 24-hour wait, then `applyFeedMaxAge`.
+ *      USDG) the anchor's constructor writes an age limit from `initialMaxAge` into `feedMaxAge` (WETH
+ *      25 hours; USDG 30 hours, the age the v3 pair table and the v4 registry accept on USDG legs), so it
+ *      applies from deployment with no queued change. Stock rows keep 0, the 5-day default. Later
+ *      changes go through `queueFeedMaxAge`, a 1-hour wait, then `applyFeedMaxAge`.
  */
 library GoatChainlinkFeeds {
     address internal constant WETH  = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
@@ -138,15 +139,15 @@ library GoatChainlinkFeeds {
         tokens[31] = USO; feeds[31] = FEED_USO_USD;
     }
 
-    /// @notice Age limit set at deployment for the two rows that update around the clock (WETH with
-    /// "ETH / USD", USDG with "USDG / USD", 24-hour heartbeat): 25 hours. Any other (token, feed) gets 0,
-    /// which means `MAX_FEED_AGE`.
+    /// @notice Age limit set at deployment for the two rows that update around the clock (24-hour heartbeat):
+    /// WETH with "ETH / USD" 25 hours; USDG with "USDG / USD" 30 hours, the age the v3 pair table and the v4
+    /// registry accept on USDG legs, so a late USDG round they still accept also gives an anchor here. Any other
+    /// (token, feed) gets 0, which means `MAX_FEED_AGE`.
     /// @dev Token and feed must both match, because the limit follows the feed's update schedule. The same
     /// token installed with a different feed keeps the default.
     function initialMaxAge(address token, address feed) internal pure returns (uint32) {
-        if ((token == WETH && feed == FEED_ETH_USD) || (token == USDG && feed == FEED_USDG_USD)) {
-            return 25 hours;
-        }
+        if (token == WETH && feed == FEED_ETH_USD) return 25 hours;
+        if (token == USDG && feed == FEED_USDG_USD) return 30 hours;
         return 0;
     }
 }

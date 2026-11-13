@@ -39,6 +39,9 @@ error SourceUnusable(uint8 reason);
 error SwapsOff();
 /// @notice No room in the pair's leaky swap budget (`value` = counted value, `room` = remaining; the bucket's raw units).
 error SwapBudgetExceeded(uint256 value, uint256 room);
+/// @notice No room in the pair's depth room: the source depth is below $4,000, so operator swap flows move at most a
+///         quarter of it per 15 minutes (`valueUsd8` = this run's principal, `roomUsd8` = remaining; 8-decimal USD).
+error DepthRoomExceeded(uint256 valueUsd8, uint256 roomUsd8);
 /// @notice The pair entry version a swap config is bound to has changed (the owner rewrote the entry); runs fail closed
 ///         until the position owner sets the config again. Withdraw-only runs are not affected.
 error PairChanged();
@@ -72,7 +75,7 @@ error HookBitsForbidden();
 /// @notice The value is on the registry red list (kind 1 HOOK, 2 CODEHASH, 3 TOKEN); 0x569eeecd.
 error RedListedEntry(uint8 kind, bytes32 value);
 /// @notice The entry pool's ±100-tick walk at the pair's anchor prices (whole USD) or its listed `fillUsd` is below
-///         `ENTRY_MIN_WALK_USD` ($4,000). The argument is always the measured walk, also when the failing term is
+///         `ENTRY_MIN_WALK_USD` ($1,000). The argument is always the measured walk, also when the failing term is
 ///         `fillUsd`; 0x18e3c201.
 error EntryTooThin(uint256 walkUsd);
 /// @notice A swap flow whose exec pool needs a keeper-signed fee (kinds 1 and 4) came through plain `run` /
@@ -116,6 +119,11 @@ error IsRetired();
 error RunExpired();
 error TooSoon();
 error BudgetExhausted();
+/// @notice An auto-range config must keep running after a move: it needs `standing` set.
+error StandingRequired();
+/// @notice An auto-range config needs the all-positions permission (`isApprovedForAll(owner, ENGINE)`) when it is set,
+///         so the moved position (a new id) can run again.
+error AllPositionsApprovalRequired();
 
 // --- mint and closing invariants
 error ZeroLiquidityMint();

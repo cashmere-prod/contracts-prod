@@ -27,7 +27,7 @@ abstract contract GoatRobinhood is Constants {
     address internal constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168; // 6
 
     // ---- pair table: the owner binds it once (setPairTable) and it cannot change afterwards. Adding or changing a
-    //      row takes a 24 h timelock in the table, removing is instant. No anchored flow runs before it is bound
+    //      row takes a 1 h timelock in the table, removing is instant. No anchored flow runs before it is bound
     //      (InvalidPool, fail closed). ----
     GoatPairTable public pairTable;
     event PairTableSet(address table);
@@ -39,7 +39,7 @@ abstract contract GoatRobinhood is Constants {
     // (GoatFoundingPairs, GoatFoundingNc), so every genuine table from the same build has the same deployed code; the
     // constant pins the code AND the founding data together. If GoatPairTable.sol or the founding lists change, this
     // constant must be recomputed from the final build (solc 0.8.24, optimizer 200 runs, cancun).
-    bytes32 public constant PAIR_TABLE_CODE_HASH = 0x6a38e9172508d39ba2433d67cafac3d13fb36367910258ed7f3faff08ef12e56;
+    bytes32 public constant PAIR_TABLE_CODE_HASH = 0x306fba6815ea6410843e9c4db1c2b2c3cc32d394ac4054b1fff38c46db345dfd;
 
     // ---- veto: TWAP window and K bounds (constructor). Each pair's veto pool comes from the table; VETO_POOL is only
     //      used for the chain identity check at deployment (factory.getPool(WETH, USDG, 100)) ----

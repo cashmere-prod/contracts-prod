@@ -10,20 +10,31 @@ pragma solidity 0.8.24; // pinned to the compiler of the deployed build
 // pair-specific gate G. An NC row prices a pair without Chainlink: the anchor is the 900 s TWAP of a pinned v3
 // reference pool of the same pair (the hard leg's Chainlink feed only values the pool's depth at listing). Every row
 // needs a source pool (the veto pool or the reference) with an observation cardinality of at least 1,800 and a VD4
-// depth (GoatDepthLib) of at least MIN_VETO_DEPTH_USD. AutoRange and exits with a swap run only on listed pairs; any
-// other pair gets only swap-less exits, which never read the table.
+// depth (GoatDepthLib) of at least MIN_CL_DEPTH_USD (CL rows) or MIN_NC_DEPTH_USD (NC rows). AutoRange and exits with
+// a swap run only on listed pairs; any other pair gets only swap-less exits, which never read the table.
 //
-// Roles. Widening actions are owner only and wait a 24 h timelock: adding or changing a row (queuePair -> addPair,
+// Size room. While the smaller of the source depth measured at listing and the live source depth is below
+// FULL_SIZE_DEPTH_USD, the swap flows of a row may move at most a quarter of that depth per SIZE_ROOM_WINDOW
+// (900 s), counted in one leaky bucket per pair (CL rows in whole USD at the feed prices, NC rows in raw units of the
+// hard leg at the reference's TWAP900). At FULL_SIZE_DEPTH_USD or more there is no size limit. The room follows the
+// pool by itself: no owner step, no switch. Liquidity added after listing raises the room above a quarter of the depth
+// measured at listing only once it has held: refreshDepth, open to anyone, lifts the listing depth to the lowest depth
+// it read over at least DEPTH_HOLD (24 h, so a short-lived deposit cannot lift it), and any read in that time that
+// finds the depth back at the listing depth ends the hold.
+//
+// Roles. Widening actions are owner only and wait a 1 h timelock: adding or changing a row (queuePair -> addPair,
 // queueNc -> addNc), raising a budget or an SR rate, reopening a market, unpausing swaps, adding a consumer after
 // the seal and replacing a sitting guardian. Narrowing actions are instant for the owner or the guardian: removing a
 // row, lowering a budget or an SR rate, closing a market, pausing swaps, removing a consumer, and cancelling a queued
-// row, budget raise, rate raise or reopen. A holiday closure covers at most 96 hours per call and reaches at most 7
-// days ahead; a reopen cannot clear a closure added after it was queued (lastClosureAt). Every queue lapses after
-// eta + QUEUE_GRACE (NotQueued; queue again). There is no permanent disable.
+// row, budget raise, rate raise or reopen. Narrowing the settings of a CL row (tightenPair: lower gates, shorter feed
+// ages, narrower answer bounds, same feeds and veto pool) is instant for the owner. A holiday closure covers at most
+// 96 hours per call and reaches at most 7 days ahead; a reopen cannot clear a closure added after it was queued
+// (lastClosureAt). Every queue lapses after eta + QUEUE_GRACE (NotQueued; queue again). There is no permanent disable.
 //
 // Failure mode: REVERT on any problem (no fallback). Stock and RWA feeds (marketHours) revert with MarketClosed()
 // while the market is closed: UTC Saturday and Sunday, before the weekly opening round, and in holiday hours set by
-// the owner or guardian.
+// the owner or guardian. A depth read (liveDepthOf, refreshDepth) runs while the market is closed and on a round up to
+// 7 days old; it moves no funds, and every run reads the feed with these gates.
 //
 // Swap budgets. Each pair has a leaky swap budget per leg: hard-leg input counts in raw hard-leg units, X input in
 // raw X units (never converted at the anchor price). On a CL row a budget is UNLIMITED or 0 (swaps closed). Only the
@@ -66,7 +77,7 @@ contract GoatPairTable is Ownable2Step, Constants {
     address public constant WETH = 0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73;
     address public constant USDG = 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
     address public constant V3_FACTORY = 0x1f7d7550B1b028f7571E69A784071F0205FD2EfA; // NPM.factory()
-    uint256 public constant TIMELOCK = 24 hours; // same as Automator.TIMELOCK
+    uint256 public constant TIMELOCK = 1 hours; // same as Automator.TIMELOCK
     // early bad-round filter: stock feeds had bad rounds before this time (2026-06-23 13:53:28 UTC); a round whose
     // updatedAt is not after it is rejected (the answer bounds catch such rounds as well)
     uint256 public constant FEED_EPOCH = 1782222808;
@@ -86,10 +97,19 @@ contract GoatPairTable is Ownable2Step, Constants {
     // gate applies to pools with fee <= 0.3%, gateHighFee to the higher tier (1%)
     uint24 public constant HIGH_FEE_ABOVE = 3000;
     uint16 public constant MIN_VETO_CARDINALITY = 1800;
-    // minimum depth of the source pool (CL: veto pool, NC: reference): a +-100 tick walk that crosses ticks, times a
-    // time weight (GoatDepthLib), the smaller of the two directions >= $4,000. The same floor as the v4 automation's
-    // MIN_SOURCE_DEPTH_USD; VD4 is the only depth rule.
-    uint256 public constant MIN_VETO_DEPTH_USD = 4_000;
+    // minimum depth of the source pool (CL: veto pool, NC: reference) at listing: VD4 (GoatDepthLib), the smaller of
+    // the two directions, in whole USD. The same floors and the same measure as the v4 automation's CL and NC source
+    // floors; VD4 is the only depth rule.
+    uint256 public constant MIN_CL_DEPTH_USD = 1_000;
+    uint256 public constant MIN_NC_DEPTH_USD = 2_000;
+    // size room (consumeSwap): below this depth (the smaller of the row's listing depth and the live depth) a row's
+    // swap flows may move at most depth / SIZE_ROOM_DIV per SIZE_ROOM_WINDOW; at this depth or more there is no size
+    // limit
+    uint256 public constant FULL_SIZE_DEPTH_USD = 4_000;
+    uint256 public constant SIZE_ROOM_DIV = 4;
+    uint32 public constant SIZE_ROOM_WINDOW = 900;
+    // the depth a row is listed at can rise by itself once a higher depth has held this long (refreshDepth)
+    uint256 public constant DEPTH_HOLD = 24 hours;
     // queue expiry: after eta + 7 days (inclusive) NotQueued (the Compound Timelock GRACE_PERIOD pattern)
     uint256 public constant QUEUE_GRACE = 7 days;
     uint32 public constant MIN_FEED_AGE = 1 hours;
@@ -168,9 +188,34 @@ contract GoatPairTable is Ownable2Step, Constants {
     // consumer list (SR freezes while every consumer is paused) and the queue for adding consumers after the seal
     address[] internal _consumers;
     mapping(address => uint256) public swapConsumerEta;
-    // the owner replaces a sitting guardian only after 24 h
+    // the owner replaces a sitting guardian only after 1 h
     address public pendingGuardian;
     uint256 public guardianEta;
+
+    // size room. `listed` is the source depth measured when the row was listed (seed, addPair or addNc), raised later
+    // only by refreshDepth, and `full` the depth from which no size limit applies, both in the room's unit: whole USD
+    // on a CL row (full =
+    // FULL_SIZE_DEPTH_USD), raw units of the hard leg on an NC row (full = FULL_SIZE_DEPTH_USD in hard-leg units at the
+    // listing price). The bucket counts the same unit and leaks depth / SIZE_ROOM_DIV per SIZE_ROOM_WINDOW.
+    struct DepthRef {
+        uint128 listed;
+        uint128 full;
+    }
+
+    struct SizeRoom {
+        uint128 used;
+        uint64 at;
+    }
+
+    // a running hold of refreshDepth: the lowest depth read since `since` (the room's unit); since = 0: no hold
+    struct DepthHold {
+        uint128 low;
+        uint64 since;
+    }
+
+    mapping(address => mapping(address => DepthRef)) public depthRef;
+    mapping(address => mapping(address => SizeRoom)) public sizeRoom;
+    mapping(address => mapping(address => DepthHold)) public depthHold;
 
     event PairQueued(address indexed token0, address indexed token1, uint256 eta, PairCfg cfg);
     event PairAdded(address indexed token0, address indexed token1, PairCfg cfg);
@@ -207,6 +252,12 @@ contract GoatPairTable is Ownable2Step, Constants {
     event GuardianQueued(address newGuardian, uint256 eta);
     event SwapConsumerQueued(address consumer, uint256 eta);
     event SwapConsumerRemoved(address consumer);
+    // size room and narrowing a CL row
+    event SizeRoomUsed(address indexed token0, address indexed token1, uint256 value, uint256 roomLeft);
+    // a hold started or its lowest read changed (since = 0: the hold ended without a raise)
+    event DepthHoldSet(address indexed token0, address indexed token1, uint256 low, uint64 since);
+    event DepthRaised(address indexed token0, address indexed token1, uint256 listedBefore, uint256 listed);
+    event PairTightened(address indexed token0, address indexed token1, PairCfg cfg);
 
     error MarketClosed();
     error NotQueued();
@@ -219,6 +270,8 @@ contract GoatPairTable is Ownable2Step, Constants {
     error SwapsPaused();
     // the reference's TWAP900 is outside G of SR (speed limit)
     error NcSlowFar(int24 twap, int24 slow);
+    // the input is larger than the size room left in this window (same unit as the room; see the header)
+    error SizeRoomExceeded(uint256 value, uint256 room);
 
     // InvalidPair reason codes
     uint8 internal constant P_ORDER = 1; // token0 >= token1 or a zero address
@@ -229,7 +282,8 @@ contract GoatPairTable is Ownable2Step, Constants {
     uint8 internal constant P_GATE = 6; // gate 0 or > MAX_GATE
     uint8 internal constant P_FEE = 7; // gateHighFee (if not 0) below gate or above MAX_GATE
     uint8 internal constant P_VETO = 8; // no veto pool, not a factory pool of this pair, or cardinality too low
-    uint8 internal constant P_VETO_DEPTH = 9; // source VD4 depth < MIN_VETO_DEPTH_USD (or the walk limit was exceeded)
+    uint8 internal constant P_VETO_DEPTH = 9; // source VD4 depth below the row's floor (or the walk limit was exceeded)
+    uint8 internal constant P_NARROW = 13; // tightenPair: a changed feed, decimals, class or veto pool, or a wider value
     uint8 internal constant P_STALE = 11; // feed round dead, in the future, inconsistent or older than the listing bound
     uint8 internal constant P_ANCHOR = 12; // CL anchor not computable, |tick| too large, or > MAX_GATE from the veto TWAP900
     uint8 internal constant P_NC = 10; // CL/NC clash, zero cap or capX, SR rate out of bounds, or a capIn0 change
@@ -245,7 +299,7 @@ contract GoatPairTable is Ownable2Step, Constants {
     // queuePair / queueNc, then calls seal(). Checking and writing every founding row in one constructor would exceed
     // the block gas limit. A row that fails its checks does not stop the seeding; it is skipped (FoundingRowSkipped),
     // so one row that drifted out of bounds cannot block the whole founding. A skipped row can be seeded again before
-    // the seal, or added later through the 24 h queue. An unsealed table cannot be bound by AutoRange or AutoExit
+    // the seal, or added later through the 1 h queue. An unsealed table cannot be bound by AutoRange or AutoExit
     // (GoatRobinhood._setPairTable).
     constructor() {
         if (block.chainid != 4663) revert InvalidConfig();
@@ -258,8 +312,8 @@ contract GoatPairTable is Ownable2Step, Constants {
             revert InvalidConfig();
         }
         for (uint256 i = from; i < to; ++i) {
-            uint8 r = _checkCl(rows[i].token0, rows[i].token1, rows[i].cfg);
-            if (r == 0) _listCl(rows[i].token0, rows[i].token1, rows[i].cfg);
+            (uint8 r, uint256 depth) = _checkCl(rows[i].token0, rows[i].token1, rows[i].cfg);
+            if (r == 0) _listCl(rows[i].token0, rows[i].token1, rows[i].cfg, depth);
             else emit FoundingRowSkipped(false, i, r);
         }
     }
@@ -269,8 +323,8 @@ contract GoatPairTable is Ownable2Step, Constants {
             revert InvalidConfig();
         }
         for (uint256 i = from; i < to; ++i) {
-            uint8 r = _checkNc(rows[i].token0, rows[i].token1, rows[i].cfg);
-            if (r == 0) _listNc(rows[i].token0, rows[i].token1, rows[i].cfg);
+            (uint8 r, DepthRef memory d) = _checkNc(rows[i].token0, rows[i].token1, rows[i].cfg);
+            if (r == 0) _listNc(rows[i].token0, rows[i].token1, rows[i].cfg, d);
             else emit FoundingRowSkipped(true, i, r);
         }
     }
@@ -282,7 +336,7 @@ contract GoatPairTable is Ownable2Step, Constants {
     }
 
     // ------------------------------------------------------------------ administration
-    // add or change: with addPair after 24 h (watchers are alerted by PairQueued during the wait)
+    // add or change: with addPair after 1 h (watchers are alerted by PairQueued during the wait)
     function queuePair(address token0, address token1, PairCfg calldata cfg) external onlyOwner {
         _validate(token0, token1, cfg);
         uint256 eta = block.timestamp + TIMELOCK;
@@ -302,11 +356,41 @@ contract GoatPairTable is Ownable2Step, Constants {
             ((o.feed0.marketHours && !p.cfg.feed0.marketHours) || (o.feed1.marketHours && !p.cfg.feed1.marketHours))
                 && p.eta - TIMELOCK <= lastClosureAt
         ) revert NotQueued();
-        _validate(token0, token1, p.cfg);
+        uint256 depth = _validate(token0, token1, p.cfg);
         delete _pending[token0][token1];
         // a new CL row's budget is UNLIMITED; a change to an existing row does NOT touch the budget (a swap closure by
-        // the guardian cannot be undone by a change queued before it)
-        _listCl(token0, token1, p.cfg);
+        // the guardian cannot be undone by a change queued before it). The depth measured now becomes the row's
+        // listing depth for the size room.
+        _listCl(token0, token1, p.cfg, depth);
+    }
+
+    // narrowing a CL row: instant, owner only. Accepted only with the same feeds (proxy, feed and token decimals,
+    // market-hours class) and the same veto pool, and with every gate, feed age and answer bound equal or narrower (at
+    // least one strictly narrower). The row stays listed either way, so the depth and anchor checks of a listing do
+    // not run again, and the listing depth of the size room is kept. A change of the row queued before is cancelled,
+    // so it cannot undo the narrowing; widening keeps the 1 h queue and the full listing checks.
+    function tightenPair(address token0, address token1, PairCfg calldata cfg) external onlyOwner {
+        PairCfg storage o = _pairs[token0][token1];
+        if (o.feed0.proxy == address(0)) revert InvalidPool();
+        if (!_narrowsFeed(o.feed0, cfg.feed0) || !_narrowsFeed(o.feed1, cfg.feed1) || cfg.vetoPool != o.vetoPool) {
+            revert InvalidPair(P_NARROW);
+        }
+        if (cfg.gate == 0 || cfg.gate > o.gate || cfg.gateHighFee > o.gateHighFee) revert InvalidPair(P_NARROW);
+        if (cfg.gateHighFee != 0 && cfg.gateHighFee < cfg.gate) revert InvalidPair(P_FEE);
+        if (keccak256(abi.encode(cfg)) == keccak256(abi.encode(o))) revert InvalidConfig();
+        _pairs[token0][token1] = cfg;
+        if (_pending[token0][token1].eta != 0) {
+            delete _pending[token0][token1];
+            emit PairQueueCancelled(token0, token1);
+        }
+        emit PairTightened(token0, token1, cfg);
+    }
+
+    // same feed and class, age and answer range equal or narrower
+    function _narrowsFeed(FeedCfg storage o, FeedCfg calldata n) internal view returns (bool) {
+        return n.proxy == o.proxy && n.feedDecimals == o.feedDecimals && n.tokenDecimals == o.tokenDecimals
+            && n.marketHours == o.marketHours && n.maxAge >= MIN_FEED_AGE && n.maxAge <= o.maxAge
+            && n.minAnswer >= o.minAnswer && n.maxAnswer <= o.maxAnswer && n.maxAnswer > n.minAnswer;
     }
 
     // removal is instant (owner or guardian); a pending addition is deleted too
@@ -340,8 +424,8 @@ contract GoatPairTable is Ownable2Step, Constants {
     }
 
     // the guardian hands its role over (or resigns, g = 0) immediately; the owner sets the FIRST guardian immediately
-    // and replaces a sitting one only through queueGuardian -> applyGuardian (24 h, until eta + 7 days). The sitting
-    // guardian cannot cancel its own replacement (so the owner can always replace it); during the 24 h it can still
+    // and replaces a sitting one only through queueGuardian -> applyGuardian (1 h, until eta + 7 days). The sitting
+    // guardian cannot cancel its own replacement (so the owner can always replace it); during the 1 h it can still
     // cancel or pause any widening the owner queued alongside.
     function setGuardian(address g) external {
         if (msg.sender != guardian || guardian == address(0)) {
@@ -351,7 +435,7 @@ contract GoatPairTable is Ownable2Step, Constants {
             return;
         }
         // a guardian handover (or a "handover" to itself) keeps the owner's queued replacement, so the sitting guardian
-        // cannot void the 24 h queue right before applyGuardian
+        // cannot void the 1 h queue right before applyGuardian
         guardian = g;
         emit GuardianChanged(g);
     }
@@ -402,7 +486,7 @@ contract GoatPairTable is Ownable2Step, Constants {
         emit MarketClosureAdded(fromHour, toHour);
     }
 
-    // a reopen WIDENS the service, so like an addition it is owner only with a 24 h timelock (queueReopen ->
+    // a reopen WIDENS the service, so like an addition it is owner only with a 1 h timelock (queueReopen ->
     // reopenMarket); the guardian or the owner can cancel a pending one (narrowing). Range: [fromHour, toHour), at
     // most MAX_CLOSURE_AHEAD_HOURS hours.
     function queueReopen(uint256 fromHour, uint256 toHour) external onlyOwner {
@@ -437,7 +521,7 @@ contract GoatPairTable is Ownable2Step, Constants {
     }
 
     // ------------------------------------------------------------------ NC rows (same roles as CL rows)
-    // add or change: 24 h timelock (queueNc -> addNc, until eta + 7 days); removal and queue cancellation are instant
+    // add or change: 1 h timelock (queueNc -> addNc, until eta + 7 days); removal and queue cancellation are instant
     // (owner or guardian)
     function queueNc(address token0, address token1, NcCfg calldata cfg) external onlyOwner {
         _validateNc(token0, token1, cfg);
@@ -452,9 +536,9 @@ contract GoatPairTable is Ownable2Step, Constants {
         // a true -> false marketHours change queued before (or in the same second as) the last closure needs a new
         // queue, so closeMarket and the SR freeze stay in force
         if (_nc[token0][token1].marketHours && !q.cfg.marketHours && q.eta - TIMELOCK <= lastClosureAt) revert NotQueued();
-        _validateNc(token0, token1, q.cfg);
+        DepthRef memory d = _validateNc(token0, token1, q.cfg);
         delete _ncPending[token0][token1];
-        _listNc(token0, token1, q.cfg);
+        _listNc(token0, token1, q.cfg, d);
     }
 
     function removeNc(address token0, address token1) external onlyOwnerOrGuardian {
@@ -505,7 +589,7 @@ contract GoatPairTable is Ownable2Step, Constants {
         emit SwapCapLowered(token0, token1, cap, capX);
     }
 
-    // RAISING is owner only, with a 24 h queue (until eta + 7 days): each budget higher or equal, at least one strictly
+    // RAISING is owner only, with a 1 h queue (until eta + 7 days): each budget higher or equal, at least one strictly
     // higher; CAP_UNLIMITED = that budget is off ("budget OFF"); on a CL row only (UNLIMITED, UNLIMITED), which reopens
     // swaps
     function queueSwapCap(address token0, address token1, uint128 cap, uint128 capX) external onlyOwner {
@@ -536,7 +620,7 @@ contract GoatPairTable is Ownable2Step, Constants {
     }
 
     // bound consumers (AutoRange and AutoExit, after their deployment): an address with code. A wrong consumer could
-    // only use up budgets. Adding is instant only before seal(); after the seal it waits 24 h (queueSwapConsumer, until
+    // only use up budgets. Adding is instant only before seal(); after the seal it waits 1 h (queueSwapConsumer, until
     // eta + 7 days). Removal is instant (owner or guardian).
     function addSwapConsumer(address c) external onlyOwner {
         if (c.code.length == 0) revert InvalidConfig();
@@ -582,15 +666,24 @@ contract GoatPairTable is Ownable2Step, Constants {
     /// @notice Charges a swap flow's input (for AutoRange: the principal of both legs) to the pair's budget; bound
     ///         consumers only, called BEFORE the swap. The input counts in its OWN leg's budget, in its OWN raw units
     ///         (hard leg: swapBudget, X: swapBudgetX); the anchor price is never used in the accounting. UNLIMITED:
-    ///         returns without a write; 0: SwapsOff; otherwise a leaky bucket:
+    ///         no budget accounting; 0: SwapsOff (also for a zero input); otherwise a leaky bucket:
     ///         used = max(0, used - cap * dt / SWAP_CAP_WINDOW) + input <= cap, else SwapBudgetExceeded(input, room).
+    ///         Then the size room (see the header): while min(listing depth, live depth) is below the full-size depth,
+    ///         the input's value must fit the room left in the pair's 900 s bucket, else SizeRoomExceeded.
     function consumeSwap(address token0, address token1, bool zeroForOne, uint256 amountIn) external {
         if (!swapConsumer[msg.sender]) revert Unauthorized();
         bool hard = zeroForOne == _nc[token0][token1].capIn0;
         SwapBudget storage b = hard ? swapBudget[token0][token1] : swapBudgetX[token0][token1];
         uint256 cap = b.cap;
-        if (cap == CAP_UNLIMITED) return;
         if (cap == 0) revert SwapsOff();
+        if (amountIn == 0) return;
+        if (cap != CAP_UNLIMITED) _useBudget(b, cap, token0, token1, hard, amountIn);
+        _useSizeRoom(token0, token1, zeroForOne, amountIn);
+    }
+
+    function _useBudget(SwapBudget storage b, uint256 cap, address token0, address token1, bool hard, uint256 amountIn)
+        internal
+    {
         (uint256 used, uint256 room) = _leaked(b, cap);
         if (amountIn > room) revert SwapBudgetExceeded(amountIn, room);
         // exact leak: a zero input writes nothing, and a non-empty bucket moves `at` only by whole windows (one window
@@ -606,6 +699,196 @@ contract GoatPairTable is Ownable2Step, Constants {
         b.used = uint128(stored);
         b.at = uint64(at);
         emit SwapBudgetUsed(token0, token1, hard, amountIn, used + amountIn);
+    }
+
+    // ------------------------------------------------------------------ size room
+    // depth = min(listing depth, live depth). At the full-size depth or more nothing is charged. Below it, the input's
+    // value must fit cap - used, with cap = depth / SIZE_ROOM_DIV and used leaking cap per SIZE_ROOM_WINDOW. A live
+    // depth above min(listing depth, full-size depth) changes nothing here, so the walk may stop once it has shown that
+    // much: a deep row pays for a few ticks, and the result is the one a full walk gives.
+    function _useSizeRoom(address token0, address token1, bool zeroForOne, uint256 amountIn) internal {
+        DepthRef storage r = depthRef[token0][token1];
+        uint256 enough = r.listed < r.full ? r.listed : r.full;
+        (uint256 depth, uint256 full, uint256 value) = _roomInputs(token0, token1, zeroForOne, amountIn, enough);
+        if (depth >= full) return;
+        uint256 cap = depth / SIZE_ROOM_DIV;
+        SizeRoom storage s = sizeRoom[token0][token1];
+        uint256 used = _roomUsed(s, cap);
+        uint256 room = cap > used ? cap - used : 0;
+        if (value > room) revert SizeRoomExceeded(value, room);
+        s.used = uint128(used + value);
+        s.at = uint64(block.timestamp);
+        emit SizeRoomUsed(token0, token1, value, room - value);
+    }
+
+    function _roomUsed(SizeRoom storage s, uint256 cap) internal view returns (uint256) {
+        uint256 leak = FullMath.mulDiv(cap, block.timestamp - s.at, SIZE_ROOM_WINDOW);
+        return s.used > leak ? s.used - leak : 0;
+    }
+
+    // the room's inputs in the row's unit: CL rows in whole USD (the input valued at its feed, rounded up), NC rows in
+    // raw hard-leg units (an X input converted at the reference's TWAP900, rounded up). A live depth that cannot be
+    // measured counts as 0, so the room is 0 (fail closed). `enough`: see _liveDepthCl (NC rows always walk in full:
+    // their sources are in the 0.3% and 1% tiers, where a walk crosses few ticks).
+    function _roomInputs(address token0, address token1, bool zeroForOne, uint256 amountIn, uint256 enough)
+        internal
+        view
+        returns (uint256 depth, uint256 full, uint256 value)
+    {
+        DepthRef storage r = depthRef[token0][token1];
+        full = r.full;
+        PairCfg storage c = _pairs[token0][token1];
+        uint256 live;
+        if (c.feed0.proxy != address(0)) {
+            uint256 a0 = _readFeed(c.feed0);
+            uint256 a1 = _readFeed(c.feed1);
+            live = _liveDepthCl(c, a0, a1, enough);
+            FeedCfg storage f = zeroForOne ? c.feed0 : c.feed1;
+            value = FullMath.mulDivRoundingUp(
+                amountIn, zeroForOne ? a0 : a1, 10 ** (uint256(f.feedDecimals) + f.tokenDecimals)
+            );
+        } else {
+            NcCfg storage n = _nc[token0][token1];
+            int24 t900 = _twapOrRevert(n.refPool, NC_TWAP_WINDOW);
+            live = _liveDepthNc(n.refPool, n.capIn0, t900);
+            value = zeroForOne == n.capIn0
+                ? amountIn
+                : _convertAt(amountIn, zeroForOne, TickMath.getSqrtRatioAtTick(t900)) + 1;
+        }
+        depth = r.listed < live ? r.listed : live;
+    }
+
+    // the CL live depth in whole USD (VD4, the listing measure), exact when below `enough`, otherwise at least `enough`
+    function _liveDepthCl(PairCfg memory c, uint256 a0, uint256 a1, uint256 enough) internal view returns (uint256) {
+        (bool ok, uint128 lTw) = _timeWeightedL(c.vetoPool);
+        if (!ok) return 0;
+        (uint256 stop0, uint256 stop1) = _walkStops(c, a0, a1, enough, lTw);
+        GoatDepthLib.Depth memory d = GoatDepthLib.walkUntil(IUniswapV3Pool(c.vetoPool), lTw, stop0, stop1);
+        return d.ok ? _usdOfWalk(c, a0, a1, d, lTw) : 0;
+    }
+
+    // clipped walk amounts from which _usdOfWalk gives at least `enough`: one USD of margin for its two rounded-down
+    // steps, scaled back through the time weight and each leg's price, rounded up. A plain amount is never below its
+    // clipped amount, so both bounds of the measure reach `enough`.
+    function _walkStops(PairCfg memory c, uint256 a0, uint256 a1, uint256 enough, uint128 lTw)
+        internal
+        view
+        returns (uint256 stop0, uint256 stop1)
+    {
+        if (enough == type(uint256).max) return (enough, enough);
+        uint256 usd = enough + 1;
+        uint128 lNow = IUniswapV3Pool(c.vetoPool).liquidity();
+        if (lTw < lNow) {
+            if (lTw == 0) return (0, 0);
+            usd = FullMath.mulDivRoundingUp(usd, lNow, lTw);
+        }
+        stop0 = FullMath.mulDivRoundingUp(usd, 10 ** (uint256(c.feed0.feedDecimals) + c.feed0.tokenDecimals), a0);
+        stop1 = FullMath.mulDivRoundingUp(usd, 10 ** (uint256(c.feed1.feedDecimals) + c.feed1.tokenDecimals), a1);
+    }
+
+    function _liveDepthNc(address refPool, bool capIn0, int24 t900) internal view returns (uint256) {
+        (bool ok, uint128 lTw) = _timeWeightedL(refPool);
+        if (!ok) return 0;
+        (uint256 h, uint256 hClip, uint128 lNow, bool wOk) = _ncHardWalk(refPool, capIn0, t900, lTw);
+        return wOk ? _min(GoatDepthLib.applyTimeWeight(h, lNow, lTw), hClip) : 0;
+    }
+
+    // the 1,800 s time-weighted L without a revert (ok = false when observe fails)
+    function _timeWeightedL(address pool) internal view returns (bool, uint128) {
+        uint32[] memory ago = new uint32[](2);
+        ago[0] = GoatDepthLib.VD4_TW_WINDOW;
+        try IUniswapV3Pool(pool).observe(ago) returns (int56[] memory, uint160[] memory spl) {
+            if (spl.length != 2) return (false, 0);
+            return (true, GoatDepthLib.twFromSpl(spl[0], spl[1]));
+        } catch {
+            return (false, 0);
+        }
+    }
+
+    /// @notice The size room of a listed row: the room left in the current window (type(uint256).max when no size
+    ///         limit applies), min(listing depth, live depth), the full-size depth, and whether the unit is whole USD
+    ///         (CL rows) or raw hard-leg units (NC rows). Reverts like anchor() when a CL feed cannot be read.
+    function sizeRoomOf(address token0, address token1)
+        external
+        view
+        returns (uint256 room, uint256 depth, uint256 full, bool usd)
+    {
+        usd = _listedKind(token0, token1);
+        (depth, full,) = _roomInputs(token0, token1, true, 0, type(uint256).max);
+        if (depth >= full) return (type(uint256).max, depth, full, usd);
+        uint256 cap = depth / SIZE_ROOM_DIV;
+        uint256 used = _roomUsed(sizeRoom[token0][token1], cap);
+        room = cap > used ? cap - used : 0;
+    }
+
+    /// @notice The live depth of a listed row in the room's unit: the listing measure read now, up to the full-size
+    ///         depth. On a CL row it values the depth at the feeds' latest answers, also while the market is closed
+    ///         and on a round up to 7 days old. Reverts when an answer is not positive, is out of its bounds, fails a
+    ///         round check or is older.
+    function liveDepthOf(address token0, address token1) external view returns (uint256) {
+        return _liveDepth(token0, token1, _listedKind(token0, token1), depthRef[token0][token1].full);
+    }
+
+    function _liveDepth(address token0, address token1, bool cl, uint256 full) internal view returns (uint256 live) {
+        if (cl) {
+            PairCfg storage c = _pairs[token0][token1];
+            live = _liveDepthCl(c, _depthAnswer(c.feed0), _depthAnswer(c.feed1), full);
+        } else {
+            NcCfg storage n = _nc[token0][token1];
+            live = _liveDepthNc(n.refPool, n.capIn0, _twapOrRevert(n.refPool, NC_TWAP_WINDOW));
+        }
+        if (live > full) live = full;
+    }
+
+    // the answer that values a depth read: _readFeed's checks without market hours, and 7 days in place of maxAge. The
+    // depth it gives reaches the hold and the listing depth only; a run values its live depth with _readFeed
+    function _depthAnswer(FeedCfg storage f) internal view returns (uint256) {
+        if (AggregatorV3Interface(f.proxy).decimals() != f.feedDecimals) revert ChainlinkPriceError();
+        (uint80 r, int256 a,, uint256 u, uint80 ar) = AggregatorV3Interface(f.proxy).latestRoundData();
+        if (a <= 0 || a < f.minAnswer || a > f.maxAnswer || u <= FEED_EPOCH || u > block.timestamp || ar < r) {
+            revert ChainlinkPriceError();
+        }
+        if (block.timestamp - u > 7 days) revert ChainlinkPriceError();
+        return uint256(a);
+    }
+
+    /// @notice Open to anyone: one read of a row listed below the full-size depth. A depth above the listing depth
+    ///         starts a hold, or lowers the hold's lowest read. A depth at or below the listing depth ends the hold.
+    ///         The first read at least DEPTH_HOLD after the start raises the listing depth to the lowest read of the
+    ///         hold, at most the full-size depth. Nothing else changes: the room stays a quarter of the smaller of the
+    ///         listing depth and the live depth. Returns the listing depth after the call. Runs while the market is
+    ///         closed; reverts like liveDepthOf when a CL answer fails its checks.
+    function refreshDepth(address token0, address token1) external returns (uint256 listed) {
+        bool cl = _listedKind(token0, token1);
+        DepthRef storage r = depthRef[token0][token1];
+        listed = r.listed;
+        if (listed >= r.full) return listed;
+        uint256 live = _liveDepth(token0, token1, cl, r.full);
+        DepthHold storage h = depthHold[token0][token1];
+        if (live <= listed) {
+            if (h.since != 0) {
+                delete depthHold[token0][token1];
+                emit DepthHoldSet(token0, token1, 0, 0);
+            }
+            return listed;
+        }
+        if (h.since == 0) {
+            depthHold[token0][token1] = DepthHold(uint128(live), uint64(block.timestamp));
+            emit DepthHoldSet(token0, token1, live, uint64(block.timestamp));
+            return listed;
+        }
+        uint256 low = _min(h.low, live);
+        if (block.timestamp - h.since < DEPTH_HOLD) {
+            if (low != h.low) {
+                h.low = uint128(low);
+                emit DepthHoldSet(token0, token1, low, h.since);
+            }
+            return listed;
+        }
+        delete depthHold[token0][token1];
+        r.listed = uint128(low);
+        emit DepthRaised(token0, token1, listed, low);
+        return low;
     }
 
     // ------------------------------------------------------------------ slow reference (SR)
@@ -657,7 +940,7 @@ contract GoatPairTable is Ownable2Step, Constants {
         emit NcSlowRateLowered(token0, token1, rate);
     }
 
-    // RAISING the rate is owner only with a 24 h queue (until eta + 7 days): strictly higher and <= NC_SLOW_MAX_RATE
+    // RAISING the rate is owner only with a 1 h queue (until eta + 7 days): strictly higher and <= NC_SLOW_MAX_RATE
     function queueSlowRate(address token0, address token1, uint16 rate) external onlyOwner {
         NcCfg storage n = _nc[token0][token1];
         if (n.refPool == address(0)) revert InvalidPool();
@@ -782,6 +1065,55 @@ contract GoatPairTable is Ownable2Step, Constants {
         }
     }
 
+    /// @notice Status of a pair and fee tier for the site and the keeper; never reverts. code, in the order anchor()
+    ///         checks: 0 ready, 1 not listed or fee tier not covered, 2 swaps paused, 3 corporate action (a token
+    ///         reports oraclePaused), 4 market closed, 5 feed stale or bad round, 6 slow reference far (NC rows),
+    ///         7 swaps closed (both budgets 0), 8 extreme price, 9 source TWAP unreadable. Also the anchor tick (0 unless
+    ///         readable), the gate, the source pool, the size room left in this window (type(uint256).max: no size
+    ///         limit; 0 when it cannot be read) and its unit (true: whole USD, CL rows; false: raw hard-leg units).
+    function anchorStatus(address token0, address token1, uint24 fee)
+        external
+        view
+        returns (uint8 code, int24 tick, uint16 gate, address source, uint256 room, bool roomUsd)
+    {
+        PairCfg storage c = _pairs[token0][token1];
+        NcCfg storage n = _nc[token0][token1];
+        roomUsd = c.feed0.proxy != address(0);
+        source = roomUsd ? c.vetoPool : n.refPool;
+        gate = roomUsd ? _canonicalGate(fee, c.gate, c.gateHighFee) : _canonicalGate(fee, n.gate, n.gateHighFee);
+        if (source == address(0) || gate == 0) return (1, 0, 0, source, 0, roomUsd);
+        try this.anchor(token0, token1, fee) returns (int24 t, uint160, uint16, address) {
+            tick = t;
+        } catch (bytes memory err) {
+            return (_statusCode(token0, token1, err), 0, gate, source, 0, roomUsd);
+        }
+        if (swapBudget[token0][token1].cap == 0 && swapBudgetX[token0][token1].cap == 0) code = 7;
+        try this.sizeRoomOf(token0, token1) returns (uint256 r, uint256, uint256, bool) {
+            room = r;
+        } catch {}
+    }
+
+    // anchor()'s revert reason as an anchorStatus code
+    function _statusCode(address token0, address token1, bytes memory err) internal view returns (uint8) {
+        bytes4 s = err.length >= 4 ? bytes4(err) : bytes4(0);
+        if (s == SwapsPaused.selector) return 2;
+        if (s == MarketClosed.selector) return _reportsPaused(token0) || _reportsPaused(token1) ? 3 : 4;
+        if (
+            s == ChainlinkPriceError.selector || s == SequencerDown.selector
+                || s == SequencerGracePeriodNotOver.selector || s == SequencerUptimeFeedInvalid.selector
+        ) return 5;
+        if (s == NcSlowFar.selector) return 6;
+        if (s == InvalidPool.selector) return 8;
+        if (s == NotSupportedFeeTier.selector) return 1;
+        return 9;
+    }
+
+    // oraclePaused() answers true (the condition under which _requireOracleLive reverts)
+    function _reportsPaused(address token) internal view returns (bool) {
+        (bool ok, bytes memory r) = token.staticcall(abi.encodeWithSignature("oraclePaused()"));
+        return ok && r.length >= 32 && abi.decode(r, (uint256)) == 1;
+    }
+
     // size estimate for an intermediate route hop: the value of `amount` of `from` in `to` at the anchor prices. from
     // and to must be the pair's tokens or WETH/USDG (the WETH and USDG feeds come from the WETH/USDG row; reverts
     // without it).
@@ -868,13 +1200,20 @@ contract GoatPairTable is Ownable2Step, Constants {
     }
 
     /// @notice VD4 depth meter (the listing checks use the same code): a +-100 tick walk that crosses ticks
-    ///         (down0: token0 input, up1: token1 input, raw units) and the 1,800 s time-weighted L.
-    ///         USD = min(v(down0), v(up1)) * min(1, lTw / lNow).
+    ///         (down0: token0 input, up1: token1 input, raw units) and the 1,800 s time-weighted L. With W =
+    ///         min(v(down0), v(up1)) and W_cap the same for clippedDepth: USD = min(W * min(1, lTw / lNow), W_cap).
     function sourceDepth(address pool) external view returns (uint256 down0, uint256 up1, uint128 lNow, uint128 lTw) {
-        bool ok;
-        (down0, up1, lNow,, ok) = GoatDepthLib.walk(IUniswapV3Pool(pool));
-        if (!ok) revert GoatDepthLib.WalkTooLong();
+        GoatDepthLib.Depth memory d = GoatDepthLib.walk(IUniswapV3Pool(pool), type(uint256).max);
+        if (!d.ok) revert GoatDepthLib.WalkTooLong();
+        (down0, up1, lNow) = (d.down0, d.up1, d.lNow);
         lTw = GoatDepthLib.timeWeightedL(IUniswapV3Pool(pool));
+    }
+
+    /// @notice The same walk with every segment's liquidity clipped to the 1,800 s time-weighted L.
+    function clippedDepth(address pool) external view returns (uint256 clip0, uint256 clip1) {
+        GoatDepthLib.Depth memory d = GoatDepthLib.walk(IUniswapV3Pool(pool), GoatDepthLib.timeWeightedL(IUniswapV3Pool(pool)));
+        if (!d.ok) revert GoatDepthLib.WalkTooLong();
+        (clip0, clip1) = (d.clip0, d.clip1);
     }
 
     // market hours (stock/RWA class): open Monday 00:00 to Saturday 00:00 UTC, with a round since this week's opening,
@@ -960,57 +1299,60 @@ contract GoatPairTable is Ownable2Step, Constants {
 
     // the checks return a REASON CODE (0 = valid): the queue and add paths revert through _validate / _validateNc,
     // while seeding skips a founding row that fails (InvalidPair(reason))
-    function _validate(address token0, address token1, PairCfg memory c) internal view {
-        uint8 r = _checkCl(token0, token1, c);
+    // the valid paths also return the source depth measured now (the size room's listing depth)
+    function _validate(address token0, address token1, PairCfg memory c) internal view returns (uint256 depth) {
+        uint8 r;
+        (r, depth) = _checkCl(token0, token1, c);
         if (r != 0) revert InvalidPair(r);
     }
 
-    function _validateNc(address token0, address token1, NcCfg memory n) internal view {
-        uint8 r = _checkNc(token0, token1, n);
+    function _validateNc(address token0, address token1, NcCfg memory n) internal view returns (DepthRef memory d) {
+        uint8 r;
+        (r, d) = _checkNc(token0, token1, n);
         if (r != 0) revert InvalidPair(r);
     }
 
-    function _checkCl(address token0, address token1, PairCfg memory c) internal view returns (uint8) {
-        if (token0 == address(0) || token0 >= token1) return P_ORDER;
+    function _checkCl(address token0, address token1, PairCfg memory c) internal view returns (uint8, uint256) {
+        if (token0 == address(0) || token0 >= token1) return (P_ORDER, 0);
         // no CL row while the pair has an NC row (removeNc first)
-        if (_nc[token0][token1].refPool != address(0)) return P_NC;
+        if (_nc[token0][token1].refPool != address(0)) return (P_NC, 0);
         // a token whose oraclePaused() answers a non-bool word would make every anchor() revert (fail closed in
         // _requireOracleLive), so such a row is never listed
-        if (!_oracleFlagOk(token0) || !_oracleFlagOk(token1)) return P_TOKEN;
+        if (!_oracleFlagOk(token0) || !_oracleFlagOk(token1)) return (P_TOKEN, 0);
         (uint8 r, uint256 a0) = _checkFeed(token0, c.feed0);
-        if (r != 0) return r;
+        if (r != 0) return (r, 0);
         uint256 a1;
         (r, a1) = _checkFeed(token1, c.feed1);
-        if (r != 0) return r;
-        if (c.gate == 0 || c.gate > MAX_GATE) return P_GATE;
-        if (c.gateHighFee != 0 && (c.gateHighFee < c.gate || c.gateHighFee > MAX_GATE)) return P_FEE;
+        if (r != 0) return (r, 0);
+        if (c.gate == 0 || c.gate > MAX_GATE) return (P_GATE, 0);
+        if (c.gateHighFee != 0 && (c.gateHighFee < c.gate || c.gateHighFee > MAX_GATE)) return (P_FEE, 0);
         return _checkClSource(token0, token1, c, a0, a1);
     }
 
     // the veto pool is REQUIRED: a pair without a source is not listed (it gets only swap-less exits, which do not read
     // the table). Source: a factory pool of this pair, ring >= 1,800, observe([1800, 900, 0]) works (P_VETO);
-    // depth = the tick-crossing walk times the time weight >= MIN_VETO_DEPTH_USD (P_VETO_DEPTH).
+    // depth = VD4 (GoatDepthLib) >= MIN_CL_DEPTH_USD (P_VETO_DEPTH).
     function _checkClSource(address token0, address token1, PairCfg memory c, uint256 a0, uint256 a1)
         internal
         view
-        returns (uint8)
+        returns (uint8, uint256)
     {
-        if (c.vetoPool == address(0)) return P_VETO;
-        if (!_isPairPool(c.vetoPool, token0, token1)) return P_VETO;
+        if (c.vetoPool == address(0)) return (P_VETO, 0);
+        if (!_isPairPool(c.vetoPool, token0, token1)) return (P_VETO, 0);
         (,,, uint16 card,,,) = IUniswapV3Pool(c.vetoPool).slot0();
-        if (card < MIN_VETO_CARDINALITY) return P_VETO;
+        if (card < MIN_VETO_CARDINALITY) return (P_VETO, 0);
         (bool obsOk, int24 t900, uint128 lTw) = _observeSource(c.vetoPool);
-        if (!obsOk) return P_VETO;
+        if (!obsOk) return (P_VETO, 0);
         // the row must be anchorable from the listing answers (no overflow, |tick| <= NC_MAX_ABS_TICK) and its anchor
         // within K = MAX_GATE of the veto TWAP900 (the runtime 900 s veto bound): this catches feeds that price a
         // different asset pair than the veto pool, without rejecting rows over a momentary gap of size G
         (bool aOk, int24 at) = _anchorTick(a0, c.feed0, a1, c.feed1);
-        if (!aOk) return P_ANCHOR;
+        if (!aOk) return (P_ANCHOR, 0);
         int256 dv = int256(at) - int256(t900);
-        if ((dv < 0 ? -dv : dv) > int256(uint256(MAX_GATE))) return P_ANCHOR;
+        if ((dv < 0 ? -dv : dv) > int256(uint256(MAX_GATE))) return (P_ANCHOR, 0);
         (bool wOk, uint256 usd) = _vd4Cl(c, a0, a1, lTw);
-        if (!wOk || usd < MIN_VETO_DEPTH_USD) return P_VETO_DEPTH;
-        return 0;
+        if (!wOk || usd < MIN_CL_DEPTH_USD) return (P_VETO_DEPTH, 0);
+        return (0, usd);
     }
 
     // NC row checks (queueNc, addNc and seeding), in a fixed order (reason code in parentheses):
@@ -1026,41 +1368,63 @@ contract GoatPairTable is Ownable2Step, Constants {
     //   10. observe([1800, 900, 0]) works (8)
     //   11. |TWAP900| <= NC_MAX_ABS_TICK (4)
     //   12. calm listing: |spot - TWAP900| <= G (4)
-    //   13. VD4 depth >= MIN_VETO_DEPTH_USD, X valued via the reference's TWAP900 and the hard feed (9)
-    function _checkNc(address token0, address token1, NcCfg memory n) internal view returns (uint8) {
-        if (token0 == address(0) || token0 >= token1) return P_ORDER;
-        if (_pairs[token0][token1].feed0.proxy != address(0)) return P_NC;
-        if (n.gate == 0 || n.gate > NC_MAX_GATE) return P_GATE;
-        if (n.gateHighFee != 0 && (n.gateHighFee < n.gate || n.gateHighFee > NC_MAX_GATE)) return P_FEE;
-        if (n.cap == 0) return P_NC;
+    //   13. VD4 depth >= MIN_NC_DEPTH_USD, X valued via the reference's TWAP900 and the hard feed (9)
+    // A valid row also returns its size-room reference in raw hard-leg units (see DepthRef).
+    function _checkNc(address token0, address token1, NcCfg memory n) internal view returns (uint8, DepthRef memory d) {
+        if (token0 == address(0) || token0 >= token1) return (P_ORDER, d);
+        if (_pairs[token0][token1].feed0.proxy != address(0)) return (P_NC, d);
+        if (n.gate == 0 || n.gate > NC_MAX_GATE) return (P_GATE, d);
+        if (n.gateHighFee != 0 && (n.gateHighFee < n.gate || n.gateHighFee > NC_MAX_GATE)) return (P_FEE, d);
+        if (n.cap == 0) return (P_NC, d);
         // capX 0 is not accepted; the SR rate must lie in [150, 4000] ticks per hour
-        if (n.capX == 0) return P_NC;
-        if (n.slowRate < NC_SLOW_MIN_RATE || n.slowRate > NC_SLOW_MAX_RATE) return P_NC;
+        if (n.capX == 0) return (P_NC, d);
+        if (n.slowRate < NC_SLOW_MIN_RATE || n.slowRate > NC_SLOW_MAX_RATE) return (P_NC, d);
         // the hard leg of an existing row does not change (the budgets would swap units, and an X budget lowered by the
         // guardian would become the hard input's budget); to change the hard leg use removeNc + queueNc (a new row)
         NcCfg storage old = _nc[token0][token1];
-        if (old.refPool != address(0) && old.capIn0 != n.capIn0) return P_NC;
-        if (!_decimalsOk(token0) || !_decimalsOk(token1)) return P_TOKEN;
+        if (old.refPool != address(0) && old.capIn0 != n.capIn0) return (P_NC, d);
+        if (!_decimalsOk(token0) || !_decimalsOk(token1)) return (P_TOKEN, d);
         // same oraclePaused() answer check as _checkCl
-        if (!_oracleFlagOk(token0) || !_oracleFlagOk(token1)) return P_TOKEN;
+        if (!_oracleFlagOk(token0) || !_oracleFlagOk(token1)) return (P_TOKEN, d);
         (uint8 r, uint256 aHard) = _checkFeed(n.capIn0 ? token0 : token1, n.hardFeed);
-        if (r != 0) return r;
+        if (r != 0) return (r, d);
         return _checkNcSource(token0, token1, n, aHard);
     }
 
-    function _checkNcSource(address token0, address token1, NcCfg memory n, uint256 aHard) internal view returns (uint8) {
-        if (!_isPairPool(n.refPool, token0, token1)) return P_VETO;
+    function _checkNcSource(address token0, address token1, NcCfg memory n, uint256 aHard)
+        internal
+        view
+        returns (uint8, DepthRef memory d)
+    {
+        if (!_isPairPool(n.refPool, token0, token1)) return (P_VETO, d);
         (, int24 spot,, uint16 ring,,,) = IUniswapV3Pool(n.refPool).slot0();
-        if (_beyondNs7(spot)) return P_BOUNDS;
-        if (MIN_VETO_CARDINALITY > ring) return P_VETO;
+        if (_beyondNs7(spot)) return (P_BOUNDS, d);
+        if (MIN_VETO_CARDINALITY > ring) return (P_VETO, d);
         (bool obsOk, int24 t900, uint128 lTw) = _observeSource(n.refPool);
-        if (!obsOk) return P_VETO;
-        if (_beyondNs7(t900)) return P_BOUNDS;
+        if (!obsOk) return (P_VETO, d);
+        if (_beyondNs7(t900)) return (P_BOUNDS, d);
         int256 dd = int256(spot) - int256(t900);
-        if ((dd < 0 ? -dd : dd) > int256(uint256(n.gate))) return P_BOUNDS;
-        (bool wOk, uint256 usd) = _vd4Nc(n, aHard, t900, lTw);
-        if (!wOk || usd < MIN_VETO_DEPTH_USD) return P_VETO_DEPTH;
-        return 0;
+        if ((dd < 0 ? -dd : dd) > int256(uint256(n.gate))) return (P_BOUNDS, d);
+        return _ncDepth(n, aHard, t900, lTw);
+    }
+
+    // the NC depth rule (P_VETO_DEPTH) and the size-room reference: the listing depth in hard-leg units and the
+    // hard-leg amount worth FULL_SIZE_DEPTH_USD at the listing answer (rounded up)
+    function _ncDepth(NcCfg memory n, uint256 aHard, int24 t900, uint128 lTw)
+        internal
+        view
+        returns (uint8, DepthRef memory d)
+    {
+        (bool wOk, uint256 usd, uint256 hardDepth) = _vd4Nc(n, aHard, t900, lTw);
+        if (!wOk || usd < MIN_NC_DEPTH_USD) return (P_VETO_DEPTH, d);
+        uint256 k = 10 ** (uint256(n.hardFeed.feedDecimals) + n.hardFeed.tokenDecimals);
+        d.listed = _toU128(hardDepth);
+        d.full = _toU128(FullMath.mulDivRoundingUp(FULL_SIZE_DEPTH_USD, k, aHard));
+        return (0, d);
+    }
+
+    function _toU128(uint256 x) internal pure returns (uint128) {
+        return x > type(uint128).max ? type(uint128).max : uint128(x);
     }
 
     // source identity: has code, holds this pair's tokens, registered in the factory (independent of PoolAddress)
@@ -1103,44 +1467,86 @@ contract GoatPairTable is Ownable2Step, Constants {
         }
     }
 
-    // VD4 of a CL row (USD): valued with the row's feed answers (a0, a1), the smaller of the two directions times the
-    // time weight
+    // VD4 of a CL row (USD): valued with the row's feed answers (a0, a1)
     function _vd4Cl(PairCfg memory c, uint256 a0, uint256 a1, uint128 lTw) internal view returns (bool, uint256) {
-        (uint256 d0, uint256 u1, uint128 lNow,, bool ok) = GoatDepthLib.walk(IUniswapV3Pool(c.vetoPool));
-        if (!ok) return (false, 0);
-        uint256 v0 = FullMath.mulDiv(d0, a0, 10 ** (uint256(c.feed0.feedDecimals) + c.feed0.tokenDecimals));
-        uint256 v1 = FullMath.mulDiv(u1, a1, 10 ** (uint256(c.feed1.feedDecimals) + c.feed1.tokenDecimals));
-        return (true, GoatDepthLib.applyTimeWeight(v0 < v1 ? v0 : v1, lNow, lTw));
+        GoatDepthLib.Depth memory d = GoatDepthLib.walk(IUniswapV3Pool(c.vetoPool), lTw);
+        if (!d.ok) return (false, 0);
+        return (true, _usdOfWalk(c, a0, a1, d, lTw));
+    }
+
+    // VD4 of a walk in whole USD: min(fac * W, W_cap), each of W and W_cap the smaller side of the walk
+    function _usdOfWalk(PairCfg memory c, uint256 a0, uint256 a1, GoatDepthLib.Depth memory d, uint128 lTw)
+        internal
+        pure
+        returns (uint256)
+    {
+        uint256 k0 = 10 ** (uint256(c.feed0.feedDecimals) + c.feed0.tokenDecimals);
+        uint256 k1 = 10 ** (uint256(c.feed1.feedDecimals) + c.feed1.tokenDecimals);
+        uint256 w = _min(FullMath.mulDiv(d.down0, a0, k0), FullMath.mulDiv(d.up1, a1, k1));
+        uint256 wCap = _min(FullMath.mulDiv(d.clip0, a0, k0), FullMath.mulDiv(d.clip1, a1, k1));
+        return _min(GoatDepthLib.applyTimeWeight(w, d.lNow, lTw), wCap);
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
     }
 
     // VD4 of an NC row (USD): the X leg converted to raw hard-leg units at the reference's TWAP900, then to USD with
-    // the hard feed
-    function _vd4Nc(NcCfg memory n, uint256 aHard, int24 t900, uint128 lTw) internal view returns (bool, uint256) {
-        (uint256 d0, uint256 u1, uint128 lNow,, bool ok) = GoatDepthLib.walk(IUniswapV3Pool(n.refPool));
-        if (!ok) return (false, 0);
-        uint160 sp = TickMath.getSqrtRatioAtTick(t900);
+    // the hard feed; also the same depth in raw hard-leg units (before the USD conversion). VD4 = min(fac * W, W_cap).
+    function _vd4Nc(NcCfg memory n, uint256 aHard, int24 t900, uint128 lTw)
+        internal
+        view
+        returns (bool, uint256, uint256)
+    {
+        (uint256 h, uint256 hClip, uint128 lNow, bool ok) = _ncHardWalk(n.refPool, n.capIn0, t900, lTw);
+        if (!ok) return (false, 0, 0);
+        // USD of the smaller side: floor(h * a / k) is monotone in h, so this equals the smaller of the two USD values
         uint256 k = 10 ** (uint256(n.hardFeed.feedDecimals) + n.hardFeed.tokenDecimals);
-        uint256 v0 = FullMath.mulDiv(n.capIn0 ? d0 : _convertAt(d0, true, sp), aHard, k);
-        uint256 v1 = FullMath.mulDiv(n.capIn0 ? _convertAt(u1, false, sp) : u1, aHard, k);
-        return (true, GoatDepthLib.applyTimeWeight(v0 < v1 ? v0 : v1, lNow, lTw));
+        uint256 v = _min(GoatDepthLib.applyTimeWeight(FullMath.mulDiv(h, aHard, k), lNow, lTw), FullMath.mulDiv(hClip, aHard, k));
+        return (true, v, _min(GoatDepthLib.applyTimeWeight(h, lNow, lTw), hClip));
+    }
+
+    // the smaller side of the reference's walk in raw hard-leg units (the X side converted at TWAP900), plain and with
+    // the segments clipped to `cap`, and L_now
+    function _ncHardWalk(address refPool, bool capIn0, int24 t900, uint128 cap)
+        internal
+        view
+        returns (uint256 h, uint256 hClip, uint128 lNow, bool ok)
+    {
+        GoatDepthLib.Depth memory d = GoatDepthLib.walk(IUniswapV3Pool(refPool), cap);
+        if (!d.ok) return (0, 0, 0, false);
+        uint160 sp = TickMath.getSqrtRatioAtTick(t900);
+        h = _hardSide(d.down0, d.up1, capIn0, sp);
+        hClip = _hardSide(d.clip0, d.clip1, capIn0, sp);
+        (lNow, ok) = (d.lNow, true);
+    }
+
+    function _hardSide(uint256 d0, uint256 u1, bool capIn0, uint160 sp) internal pure returns (uint256) {
+        return _min(capIn0 ? d0 : _convertAt(d0, true, sp), capIn0 ? _convertAt(u1, false, sp) : u1);
     }
 
     // ------------------------------------------------------------------ internal helpers
-    // writes a CL row: a new row's budget is UNLIMITED; a change to an existing row leaves the budget alone
-    function _listCl(address token0, address token1, PairCfg memory c) internal {
+    // writes a CL row: a new row's budget is UNLIMITED; a change to an existing row leaves the budget alone. The source
+    // depth measured by this listing becomes the size room's listing depth (whole USD).
+    function _listCl(address token0, address token1, PairCfg memory c, uint256 depth) internal {
         if (_pairs[token0][token1].feed0.proxy == address(0)) {
             swapBudget[token0][token1] = SwapBudget(CAP_UNLIMITED, 0, 0);
             swapBudgetX[token0][token1] = SwapBudget(CAP_UNLIMITED, 0, 0); // X leg budget
         }
+        depthRef[token0][token1] = DepthRef(_toU128(depth), uint128(FULL_SIZE_DEPTH_USD));
+        delete depthHold[token0][token1];
         _pairs[token0][token1] = c;
         emit PairAdded(token0, token1, c);
     }
 
     // writes an NC row: for a new row the budget = cfg.cap (empty, now); a change to an existing row can only LOWER the
-    // budget (raising goes through its own 24 h queue, so a change queued earlier cannot undo a lowering by the
+    // budget (raising goes through its own 1 h queue, so a change queued earlier cannot undo a lowering by the
     // guardian). The X budget follows the same rule. For a new row SR starts at the reference's current TWAP900; a
-    // change to an existing row keeps SR (no jump) and can only LOWER the rate (raising is queueSlowRate, 24 h).
-    function _listNc(address token0, address token1, NcCfg memory n) internal {
+    // change to an existing row keeps SR (no jump) and can only LOWER the rate (raising is queueSlowRate, 1 h). The
+    // size-room reference measured by this listing is stored (raw hard-leg units).
+    function _listNc(address token0, address token1, NcCfg memory n, DepthRef memory d) internal {
+        depthRef[token0][token1] = d;
+        delete depthHold[token0][token1];
         SwapBudget storage b = swapBudget[token0][token1];
         SwapBudget storage x = swapBudgetX[token0][token1];
         NcCfg storage old = _nc[token0][token1];
@@ -1176,9 +1582,13 @@ contract GoatPairTable is Ownable2Step, Constants {
         emit NcAdded(token0, token1, n);
     }
 
+    // on removal: the budgets, a pending raise, and the size room with its listing depth and hold
     function _dropBudget(address token0, address token1) internal {
         delete swapBudget[token0][token1];
         delete swapBudgetX[token0][token1]; // X leg budget
+        delete depthRef[token0][token1];
+        delete sizeRoom[token0][token1];
+        delete depthHold[token0][token1];
         _cancelCapRaise(token0, token1);
     }
 

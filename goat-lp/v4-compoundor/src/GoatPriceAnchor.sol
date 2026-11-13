@@ -57,7 +57,7 @@ interface IUniV3Pool {
  * assigned can never be the anchor. The approach is similar to Revert Finance's `V4Oracle`; this code is an
  * independent implementation, not a copy (theirs is BUSL-1.1).
  *
- * @dev Trust model: the owner (a multisig) chooses the sources, but every change waits `CONFIG_DELAY` (24 hours)
+ * @dev Trust model: the owner (a multisig) chooses the sources, but every change waits `CONFIG_DELAY` (1 hour)
  * in public, emits an event and lapses if it is not applied within `CONFIG_GRACE`. The worst an owner can do is
  * point a pair at a poor pool or remove its anchor; compound consumers then risk at most the collected fees,
  * since the compound flow never withdraws principal. There is deliberately no instant override.
@@ -108,7 +108,7 @@ contract GoatPriceAnchor is Ownable2Step {
     uint8 private constant MAX_TOKEN_DECIMALS = 36;
 
     /// @notice How long an owner change waits before it can be applied.
-    uint256 public constant CONFIG_DELAY = 24 hours;
+    uint256 public constant CONFIG_DELAY = 1 hours;
     /// @notice A matured change lapses if it is not applied within this time, so an old intent cannot be applied later.
     uint256 public constant CONFIG_GRACE = 14 days;
 
@@ -141,7 +141,7 @@ contract GoatPriceAnchor is Ownable2Step {
      * @notice Chainlink USD feed per token (ETH/USD is stored under WETH). The proxy address is stored;
      * Chainlink's advice not to pin addresses concerns the aggregator behind the proxy.
      * @dev The initial table comes from `GoatChainlinkFeeds` at deployment; every later change goes through
-     * `queueFeed`, a 24-hour wait, then `applyFeed`.
+     * `queueFeed`, a 1-hour wait, then `applyFeed`.
      */
     mapping(address => IAggregatorV3) public feedOf;
 
@@ -152,9 +152,9 @@ contract GoatPriceAnchor is Ownable2Step {
      * back to the assigned v3 pool, or to no anchor. Where a pool drifts away from a frozen weekend price,
      * compounding waits for the market to reopen: a delay, not a loss.
      * @dev This is the default and the upper bound. Feeds that update around the clock (ETH and USDG, 24-hour
-     * heartbeat) need a tighter limit, set per token in `feedMaxAge` (`queueFeedMaxAge`, a 24-hour wait, then
-     * `applyFeedMaxAge`); for WETH and USDG the constructor writes 25 hours (`GoatChainlinkFeeds.initialMaxAge`),
-     * so it applies from deployment.
+     * heartbeat) need a tighter limit, set per token in `feedMaxAge` (`queueFeedMaxAge`, a 1-hour wait, then
+     * `applyFeedMaxAge`); the constructor writes 25 hours for WETH and 30 hours for USDG
+     * (`GoatChainlinkFeeds.initialMaxAge`), so it applies from deployment.
      */
     uint256 public constant MAX_FEED_AGE = 5 days;
 
@@ -223,7 +223,7 @@ contract GoatPriceAnchor is Ownable2Step {
      * @param _tokens Tokens that have a Chainlink feed (use the WETH address for v4 native ETH).
      * @param _feeds  Each token's USD proxy, in the same order. Both arrays may be empty.
      * @dev The deployer is the first owner and hands ownership to the multisig with the two-step transfer.
-     * No v3 pool is assigned here: the first pools also wait 24 hours through `queuePool`, in public.
+     * No v3 pool is assigned here: the first pools also wait 1 hour through `queuePool`, in public.
      */
     constructor(IUniV3Factory _factory, address _weth, address[] memory _tokens, address[] memory _feeds)
         Ownable(msg.sender)
@@ -239,7 +239,7 @@ contract GoatPriceAnchor is Ownable2Step {
             _validateFeed(_feeds[i]);
             feedOf[_tokens[i]] = IAggregatorV3(_feeds[i]);
             emit FeedSet(_tokens[i], address(0), _feeds[i]);
-            // Rows that update around the clock (WETH and USDG) get a 25-hour limit from deployment. No event:
+            // Rows that update around the clock get a limit from deployment (WETH 25 hours, USDG 30 hours). No event:
             // the value follows from the FeedSet above, and watchers read `feedMaxAge(token)`.
             uint32 ma = GoatChainlinkFeeds.initialMaxAge(_tokens[i], _feeds[i]);
             if (ma != 0) feedMaxAge[_tokens[i]] = ma;
@@ -268,7 +268,7 @@ contract GoatPriceAnchor is Ownable2Step {
         emit FeedQueued(token, feed, eta);
     }
 
-    /// @notice Applies a matured feed change. Anyone may call it: the change was announced 24 hours earlier.
+    /// @notice Applies a matured feed change. Anyone may call it: the change was announced 1 hour earlier.
     function applyFeed(address token) external {
         PendingFeed memory p = pendingFeed[token];
         _checkReady(p.eta);

@@ -67,7 +67,7 @@ abstract contract Ownable is Context {
 
     /// @dev Backported from OpenZeppelin 4.x/5.x: for a two-step transfer (Ownable2Step), the
     /// derived contract must be able to change _owner without onlyOwner.
-    /// Eklenti additive — mevcut transferOwnership davranisi AYNI kaldi.
+    /// An addition only: the behaviour of transferOwnership is unchanged.
     function _transferOwnership(address newOwner) internal virtual {
         emit OwnershipTransferred(_owner, newOwner);
         _owner = newOwner;

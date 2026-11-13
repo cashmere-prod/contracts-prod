@@ -124,6 +124,8 @@ contract GoatV4StewardEngine is IUnlockCallback {
         uint8 hookKind; // the exec pool's entry kind (0 hookless, 1 SIGNED_FEE, 3 CONST_TAX, 4 PONSV2); 2 never swaps
         uint24 feeCheck; // cap on the exec pool's live TOTAL fee (pf ⊕ lp + tax), checked right before PM.swap
         address taxRecipient; // kind 3: the bound tax recipient; must have no code at swap time unless it is the hook
+        uint128 take; // a piece: the liquidity to take (0 = the whole position, BURN_POSITION)
+        uint256 dest; // a RECENTER piece: the owner's position to add to (0 = mint a new one)
     }
 
     struct Result {
@@ -278,7 +280,7 @@ contract GoatV4StewardEngine is IUnlockCallback {
         // A plan without an anchor can only be withdraw-only: the swap / mint price limit and floor come from the anchor.
         if (!anchored && (p.recenter || p.swapExit)) revert NoAnchor();
         // Burn: BURN_POSITION (min = principal − 1), read POSM's credit, TAKE_PAIR(this): POSM's credit closes right away.
-        (uint256 cr0, uint256 cr1) = _burn(p.tokenId, key, p.p0, p.p1);
+        (uint256 cr0, uint256 cr1) = _burn(p.tokenId, key, p.p0, p.p1, p.take);
         {
             // A balance BELOW its pre-burn snapshot (a rebasing or seizing token) reverts the named `TransferShort(token)`
             // in every flow, never panic 0x11.
@@ -420,10 +422,12 @@ contract GoatV4StewardEngine is IUnlockCallback {
     }
 
     /// @dev |spot − anchor| <= G (inclusive). G is per pair (Steward plan).
+    ///      A price exactly on anchor - G counts as inside: a zeroForOne swap that ends on that tick boundary leaves
+    ///      slot0.tick one below it (the v4 tick rule), so below the gate the price is compared, not the tick.
     function _gate(bytes32 poolId, int24 anchorTick, int24 g) internal view returns (uint160 sqrtP, int24 spot) {
         (sqrtP, spot,) = GoatPoolSlots.slot0(POOL_MANAGER, poolId);
         int256 d = int256(spot) - int256(anchorTick);
-        if (d > g || d < -g) revert GateExceeded();
+        if (d > g || (d < -g && sqrtP != TickMath.getSqrtPriceAtTick(anchorTick - g))) revert GateExceeded();
     }
 
     function _limit(bool zeroForOne, int24 anchorTick, int24 g) internal pure returns (uint160) {
@@ -435,15 +439,21 @@ contract GoatV4StewardEngine is IUnlockCallback {
     /// @dev Two POSM calls. Between BURN_POSITION and TAKE_PAIR only this contract runs (two EXTTLOADs; no foreign code
     ///      sees POSM's open credit, and POSM's own lock blocks re-entry), and the credit read is exactly what TAKE_PAIR
     ///      moves. A negative delta never reaches the check: TAKE_PAIR reverts on it first.
-    function _burn(uint256 tokenId, PoolKey memory key, uint256 p0, uint256 p1)
+    function _burn(uint256 tokenId, PoolKey memory key, uint256 p0, uint256 p1, uint128 take)
         internal
         returns (uint256 cr0, uint256 cr1)
     {
         uint128 min0 = p0 > 0 ? uint128(p0 - 1) : 0;
         uint128 min1 = p1 > 0 ? uint128(p1 - 1) : 0;
         bytes[] memory params = new bytes[](1);
-        params[0] = abi.encode(tokenId, min0, min1, bytes(""));
-        POSM.modifyLiquiditiesWithoutUnlock(abi.encodePacked(uint8(Actions.BURN_POSITION)), params);
+        if (take == 0) {
+            params[0] = abi.encode(tokenId, min0, min1, bytes(""));
+            POSM.modifyLiquiditiesWithoutUnlock(abi.encodePacked(uint8(Actions.BURN_POSITION)), params);
+        } else {
+            // A piece: DECREASE_LIQUIDITY keeps the NFT and the rest (it also credits the position's LP fees).
+            params[0] = abi.encode(tokenId, uint256(take), min0, min1, bytes(""));
+            POSM.modifyLiquiditiesWithoutUnlock(abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY)), params);
+        }
         cr0 = _posmCredit(key.currency0);
         cr1 = _posmCredit(key.currency1);
         params[0] = abi.encode(key.currency0, key.currency1, address(this));
@@ -667,6 +677,15 @@ contract GoatV4StewardEngine is IUnlockCallback {
     function _mint(Result memory r, PoolKey memory key, bytes32 id, Plan memory p, Snapshot memory s) internal {
         uint256 x0 = _balance(key.currency0) - s.pre0 - r.protocolFee0;
         uint256 x1 = _balance(key.currency1) - s.pre1 - r.protocolFee1;
+        // 0) An add to the earlier pieces' position: its LP fees are taken first, so the add carries no fee credit;
+        //    they stay outside x0 / x1 and go to the owner with the refund.
+        if (p.dest != 0) {
+            bytes[] memory fp = new bytes[](1);
+            fp[0] = abi.encode(p.dest, uint256(0), uint128(0), uint128(0), bytes(""));
+            POSM.modifyLiquiditiesWithoutUnlock(abi.encodePacked(uint8(Actions.DECREASE_LIQUIDITY)), fp);
+            fp[0] = abi.encode(key.currency0, key.currency1, address(this));
+            POSM.modifyLiquiditiesWithoutUnlock(abi.encodePacked(uint8(Actions.TAKE_PAIR)), fp);
+        }
         // 1) Approvals BEFORE the price read (token code runs here).
         _approveExact(key.currency0, x0);
         _approveExact(key.currency1, x1);
@@ -691,17 +710,20 @@ contract GoatV4StewardEngine is IUnlockCallback {
         _permitPosm(key.currency1, need1);
 
         // 5-7) MINT_POSITION + CLOSE_CURRENCY ×2, empty hookData.
-        r.newTokenId = POSM.nextTokenId();
+        r.newTokenId = p.dest != 0 ? p.dest : POSM.nextTokenId();
+        uint128 before = p.dest != 0 ? POSM.getPositionLiquidity(p.dest) : 0;
         uint256 b0 = _balance(key.currency0);
         uint256 b1 = _balance(key.currency1);
         {
             bytes memory actions = abi.encodePacked(
-                uint8(Actions.MINT_POSITION), uint8(Actions.CLOSE_CURRENCY), uint8(Actions.CLOSE_CURRENCY)
+                uint8(p.dest != 0 ? Actions.INCREASE_LIQUIDITY : Actions.MINT_POSITION),
+                uint8(Actions.CLOSE_CURRENCY),
+                uint8(Actions.CLOSE_CURRENCY)
             );
             bytes[] memory params = new bytes[](3);
-            params[0] = abi.encode(
-                key, p.newLower, p.newUpper, uint256(liq), uint128(need0), uint128(need1), p.owner, bytes("")
-            );
+            params[0] = p.dest != 0
+                ? abi.encode(p.dest, uint256(liq), uint128(need0), uint128(need1), bytes(""))
+                : abi.encode(key, p.newLower, p.newUpper, uint256(liq), uint128(need0), uint128(need1), p.owner, bytes(""));
             params[1] = abi.encode(key.currency0);
             params[2] = abi.encode(key.currency1);
             POSM.modifyLiquiditiesWithoutUnlock{value: key.currency0.isAddressZero() ? need0 : 0}(actions, params);
@@ -718,7 +740,7 @@ contract GoatV4StewardEngine is IUnlockCallback {
 
         // Checks: the new NFT is the owner's, the liquidity is exact, the pool is the same.
         if (IGoatPosmNft(address(POSM)).ownerOf(r.newTokenId) != p.owner) revert MintMismatch();
-        if (POSM.getPositionLiquidity(r.newTokenId) != liq) revert MintMismatch();
+        if (POSM.getPositionLiquidity(r.newTokenId) != before + liq) revert MintMismatch();
         (PoolKey memory k2,) = POSM.getPoolAndPositionInfo(r.newTokenId);
         if (PoolId.unwrap(k2.toId()) != id) revert MintMismatch();
     }
