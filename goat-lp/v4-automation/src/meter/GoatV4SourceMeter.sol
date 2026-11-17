@@ -25,9 +25,10 @@ import "../lib/GoatV4Errors.sol";
 
 /**
  * @notice All listing-time checks of a pair row and the VD4 depth measure. STATELESS: no owner, no storage, no setters.
- *         `GoatV4PairRegistry` relies on it only at LISTING (queue, apply, founding seed) through an immutable address;
- *         run-time reads stay in the registry. Off-chain checks can call the same views with `eth_call`, so the
- *         on-chain and off-chain measures are one and the same code.
+ *         `GoatV4PairRegistry` relies on it at LISTING (queue, apply, founding seed) through an immutable address, and
+ *         at run time for one view only: `liveSourceUsd`, the live source depth behind the depth room of operator swap
+ *         flows (`K.DEPTH_ROOM_BPS`). Every other run-time read stays in the registry. Off-chain checks can call the
+ *         same views with `eth_call`, so the on-chain and off-chain measures are one and the same code.
  *
  * @dev VD4: a simulated swap from the current tick 100 ticks down (token0 in) and 100 ticks up (token1 in), crossing
  *      EVERY initialized tick on the way with its `liquidityNet` (v3: `tickBitmap` / `ticks`; v4: PoolManager
@@ -39,7 +40,7 @@ import "../lib/GoatV4Errors.sol";
  *      W = min(value(down), value(up)) (whole USD) is the raw walk and W_cap the same walk with EVERY segment's
  *      liquidity clipped to `min(L_seg, L_tw)` (POKE: `minL`). Recently added liquidity, in range or not, is never
  *      counted above the time-weighted in-range level in any segment, and VD4 never exceeds `fac · W`.
- *      The exec-pool walk (floor $500, `K.MIN_POOL_FILL_USD`) and the `v3Depth` / `v4Depth` views are the raw,
+ *      The exec-pool walk (floor $250, `K.MIN_POOL_FILL_USD`) and the `v3Depth` / `v4Depth` views are the raw,
  *      unclipped walk. There is no relative "deepest tier" rule.
  *      CL_V3DERIVED (kind 6): the path c0 -> Q -> c1 over two canonical v3 legs is measured per leg with the same
  *      formula at ±50 ticks (VD50) and ±100 ticks (VD4); path depth = min(VD50_1, VD50_2, VD4_1 * VD4_2 / (VD4_1 + VD4_2)).
@@ -53,10 +54,10 @@ contract GoatV4SourceMeter {
 
     uint8 public constant R_RING = 1; // v3 source ring < 1,800 (a CL_V3DERIVED leg: < 1,801)
     uint8 public constant R_OBSERVE = 2; // observe([1800, 900, 60, 10, 0]) failed
-    uint8 public constant R_DEPTH = 3; // source depth < K.MIN_SOURCE_DEPTH_USD ($4,000; CL_V3DERIVED: the path depth)
+    uint8 public constant R_DEPTH = 3; // source depth below the kind's floor ($1,000 CL v3, $2,000 NC v3, $4,000 POKE)
     uint8 public constant R_CALM = 4; // |spot − TWAP900| (POKE: |v4 spot − medMid| or the spread) > G
     uint8 public constant R_EXTREME = 5; // extreme price: |tick| > 800,000
-    uint8 public constant R_POOL_WALK = 6; // an exec pool's ±100-tick walk < $500 (K.MIN_POOL_FILL_USD)
+    uint8 public constant R_POOL_WALK = 6; // an exec pool's ±100-tick walk < $250 (K.MIN_POOL_FILL_USD)
     uint8 public constant R_POKE_GAP = 7; // the poke window is not 15/15 registered
     uint8 public constant R_WALK_BOUND = 8; // more than 256 initialized ticks in one direction
     uint8 public constant R_LIQ = 9; // inconsistent liquidity (negative while crossing)
@@ -86,6 +87,8 @@ contract GoatV4SourceMeter {
         int24 ts;
         uint256 cap; // segment liquidity cap (source: L_tw / minL; raw walk: type(uint256).max)
         int24 span; // walk length each way (VD4_TICKS; a CL_V3DERIVED leg's VD50 uses VD4_LEG_TICKS)
+        uint256 stopDown; // the walk down ends once its amount reaches this (a full walk: type(uint256).max)
+        uint256 stopUp; // the same for the walk up
     }
 
     /// @dev Listing valuation: the USD prices (8 decimals) and units of the pair's two currencies. On an NC row (`nc`)
@@ -122,6 +125,22 @@ contract GoatV4SourceMeter {
     {
         (uint160 sp, int24 tick,,,,,) = IGoatV3PoolObserve(pool).slot0();
         lNow = IGoatV3PoolDepth(pool).liquidity();
+        lTw = _lTw(pool);
+        Walk memory w = Walk(
+            false,
+            pool,
+            0,
+            IGoatV3PoolDepth(pool).tickSpacing(),
+            capTw ? lTw : type(uint256).max,
+            span,
+            type(uint256).max,
+            type(uint256).max
+        );
+        (down0, up1) = _walk(w, sp, tick, lNow);
+    }
+
+    /// @dev The source's time-weighted in-range liquidity over `VD4_TW_WINDOW`.
+    function _lTw(address pool) internal view returns (uint256) {
         uint32[] memory ago = new uint32[](2);
         ago[0] = K.VD4_TW_WINDOW;
         (, uint160[] memory spl) = IGoatV3PoolObserve(pool).observe(ago);
@@ -129,10 +148,7 @@ contract GoatV4SourceMeter {
         unchecked {
             d = uint160(spl[1] - spl[0]);
         }
-        lTw = d == 0 ? type(uint256).max : (uint256(K.VD4_TW_WINDOW) << 128) / d;
-        Walk memory w =
-            Walk(false, pool, 0, IGoatV3PoolDepth(pool).tickSpacing(), capTw ? lTw : type(uint256).max, span);
-        (down0, up1) = _walk(w, sp, tick, lNow);
+        return d == 0 ? type(uint256).max : (uint256(K.VD4_TW_WINDOW) << 128) / d;
     }
 
     /// @notice ±100-tick walk of a v4 pool (raw units) and its current liquidity (`extsload`; v4 has no time weight).
@@ -151,7 +167,8 @@ contract GoatV4SourceMeter {
         uint160 sp = uint160(w0);
         if (sp == 0) revert BadPairEntry();
         lNow = uint128(uint256(POOL_MANAGER.extsload(bytes32(st + 3))));
-        (down0, up1) = _walk(Walk(true, address(0), st, ts, cap, K.VD4_TICKS), sp, int24(uint24(w0 >> 160)), lNow);
+        Walk memory w = Walk(true, address(0), st, ts, cap, K.VD4_TICKS, type(uint256).max, type(uint256).max);
+        (down0, up1) = _walk(w, sp, int24(uint24(w0 >> 160)), lNow);
     }
 
     function _walk(Walk memory w, uint160 sp, int24 tick, uint128 l)
@@ -176,6 +193,7 @@ contract GoatV4SourceMeter {
                 amt += SqrtPriceMath.getAmount0Delta(sn, cur, _capL(l, w.cap), false);
                 cur = sn;
             }
+            if (amt >= w.stopDown) return amt;
             if (!init) return amt;
             l -= _net(w, next);
             if (l < 0) revert SourceUnusable(R_LIQ);
@@ -197,6 +215,7 @@ contract GoatV4SourceMeter {
                 amt += SqrtPriceMath.getAmount1Delta(cur, sn, _capL(l, w.cap), false);
                 cur = sn;
             }
+            if (amt >= w.stopUp) return amt;
             if (!init) return amt;
             l += _net(w, next);
             if (l < 0) revert SourceUnusable(R_LIQ);
@@ -381,8 +400,10 @@ contract GoatV4SourceMeter {
     }
 
     /// @dev Structural and live health of a feed rule; returns the current answer (8 decimals). Session and age are NOT checked.
+    ///      `maxAge` in [MIN_FEED_AGE, MAX_FEED_AGE]; on the USDG/USD feed (24-hour heartbeat) up to MAX_FEED_AGE_USDG.
     function _feed(FeedRule memory r) internal view returns (uint256) {
-        if (r.feed == address(0) || r.maxAge < K.MIN_FEED_AGE || r.maxAge > K.MAX_FEED_AGE) revert BadPairEntry();
+        uint32 ceiling = r.feed == K.USDG_USD_FEED ? K.MAX_FEED_AGE_USDG : K.MAX_FEED_AGE;
+        if (r.feed == address(0) || r.maxAge < K.MIN_FEED_AGE || r.maxAge > ceiling) revert BadPairEntry();
         if (r.minAnswer == 0 || r.minAnswer >= r.maxAnswer || r.maxAnswer > K.BAD_ROUND_CEILING) revert BadPairEntry();
         if (IGoatChainlinkFeed(r.feed).decimals() != 8) revert BadPairEntry();
         (, int256 a,,,) = IGoatChainlinkFeed(r.feed).latestRoundData();
@@ -398,7 +419,7 @@ contract GoatV4SourceMeter {
         return keccak256(abi.encode(c0, c1, p.fee, p.tickSpacing, p.hooks));
     }
 
-    /// @dev Exec pools: 1 … 8, declared fill >= $500 (K.MIN_POOL_FILL_USD), initialized in the PoolManager (sqrtP != 0),
+    /// @dev Exec pools: 1 … 8, declared fill >= $250 (K.MIN_POOL_FILL_USD), initialized in the PoolManager (sqrtP != 0),
     ///      poolIds UNIQUE.
     function _checkPoolsShape(address c0, address c1, PoolSpec[] memory pools) internal view {
         if (pools.length == 0 || pools.length > K.MAX_POOLS) revert BadPairEntry();
@@ -495,22 +516,42 @@ contract GoatV4SourceMeter {
 
     /// @notice FULL listing check of a CL row: the structural entry plus source and pool usability.
     function validateCl(address c0, address c1, PairConfig memory cfg) external view returns (PairEntry memory e) {
+        (e,) = _validateCl(c0, c1, cfg);
+    }
+
+    /// @notice `validateCl` plus the source depth (USD) the check measured (0 on a withdraw-only row). The registry
+    ///         stores it as the row's depth at listing (the depth room, `K.DEPTH_ROOM_BPS`).
+    function measureCl(address c0, address c1, PairConfig memory cfg)
+        external
+        view
+        returns (PairEntry memory e, uint256 srcUsd)
+    {
+        return _validateCl(c0, c1, cfg);
+    }
+
+    /// @dev Source floors: CL_V3 and CL_V3DERIVED `MIN_CL_SOURCE_DEPTH_USD`, CL_POKE `MIN_POKE_SOURCE_DEPTH_USD`.
+    function _validateCl(address c0, address c1, PairConfig memory cfg)
+        internal
+        view
+        returns (PairEntry memory e, uint256 srcUsd)
+    {
         e = entryCl(c0, c1, cfg);
         Px memory px = _clPx(cfg, e);
         _checkExecPools(c0, c1, cfg.pools, px);
-        if (e.srcKind == K.SRC_NONE) return e;
+        if (e.srcKind == K.SRC_NONE) return (e, 0);
         // At listing the source must agree with the feed anchor within the bound of `vetoOf`'s AnchorVetoed rule.
         (, int24 fa) = GoatAnchorLib.pairSqrtPrice(px.usd0, px.usd1, e.dec0, e.dec1);
         if (e.srcKind == K.SRC_CL_V3) {
             _v3SourceUsable(e.vetoPool, cfg.gate);
             _agree(fa, GoatAnchorLib.twapTick(e.vetoPool, K.VETO_WINDOW, e.vetoFlip), e.vetoTicks);
-            if (_v3SourceUsd(e.vetoPool, e.vetoFlip, px) < K.MIN_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
+            srcUsd = _v3SourceUsd(e.vetoPool, e.vetoFlip, px);
+            if (srcUsd < K.MIN_CL_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
         } else if (e.srcKind == K.SRC_CL_V3DERIVED) {
             _pathSourceUsable(e, cfg.gate, fa);
-            (uint256 v,,) = _pathDepth(e, c0, px);
-            if (v < K.MIN_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
+            (srcUsd,,) = _pathDepth(e, c0, px);
+            if (srcUsd < K.MIN_CL_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
         } else {
-            _pokeSourceUsable(c0, c1, cfg.source.pokePool, cfg.pools, cfg.gate, px);
+            srcUsd = _pokeSourceUsable(c0, c1, cfg.source.pokePool, cfg.pools, cfg.gate, px);
             _agree(fa, POKE_ORACLE.consult(cfg.source.pokePool).medMid, e.vetoTicks);
         }
     }
@@ -648,10 +689,109 @@ contract GoatV4SourceMeter {
         view
         returns (PairEntry memory e, NcSource memory n)
     {
+        (e, n,) = _validateNc(c0, c1, cfg);
+    }
+
+    /// @notice `validateNc` plus the source depth (USD) the check measured (the registry's depth at listing).
+    function measureNc(address c0, address c1, NcPairConfig memory cfg)
+        external
+        view
+        returns (PairEntry memory e, NcSource memory n, uint256 srcUsd)
+    {
+        return _validateNc(c0, c1, cfg);
+    }
+
+    /// @dev Source floors: NC_V3SAME and NC_V3DERIVED `MIN_NC_SOURCE_DEPTH_USD`, NC_POKE `MIN_POKE_SOURCE_DEPTH_USD`.
+    function _validateNc(address c0, address c1, NcPairConfig memory cfg)
+        internal
+        view
+        returns (PairEntry memory e, NcSource memory n, uint256 srcUsd)
+    {
         (e, n) = entryNc(c0, c1, cfg);
-        (Px memory px, uint256 srcUsd,) = _ncMeasure(c0, c1, cfg, e, n, true);
-        if (srcUsd < K.MIN_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
+        Px memory px;
+        (px, srcUsd,) = _ncMeasure(c0, c1, cfg, e, n, true);
+        uint256 floor = e.srcKind == K.SRC_NC_POKE ? K.MIN_POKE_SOURCE_DEPTH_USD : K.MIN_NC_SOURCE_DEPTH_USD;
+        if (srcUsd < floor) revert SourceUnusable(R_DEPTH);
         _checkExecPools(c0, c1, cfg.pools, px);
+    }
+
+    /**
+     * @notice LIVE source depth (USD, no threshold) of a stored row with a v3 source (CL_V3, CL_V3DERIVED, NC_V3SAME,
+     *         NC_V3DERIVED): the same VD4 measure as at listing (`measureCl` / `measureNc`), computed from the stored
+     *         entry and the current feed answers. Every other kind (NONE, POKE): `type(uint256).max` (no depth room).
+     *         Read by the registry for the depth room of operator swap flows. On Chainlink-priced kinds a source proven
+     *         to hold `K.FULL_SIZE_DEPTH_USD` or more returns exactly that value (`_reaches`, `_pathReaches`): the
+     *         registry only needs the exact depth below it, so a deep source does not pay for the full walks.
+     */
+    function liveSourceUsd(address c0, address, PairEntry memory e, NcSource memory n)
+        external
+        view
+        returns (uint256 v)
+    {
+        uint8 k = e.srcKind;
+        if (k == K.SRC_CL_V3 || k == K.SRC_CL_V3DERIVED) {
+            Px memory px;
+            (px.usd0, px.usd1, px.unit0, px.unit1) = (_answer(e.feed0), _answer(e.feed1), 10 ** e.dec0, 10 ** e.dec1);
+            if (k == K.SRC_CL_V3) {
+                (uint256 u0, uint256 n0, uint256 u1, uint256 n1) =
+                    e.vetoFlip ? (px.usd1, px.unit1, px.usd0, px.unit0) : (px.usd0, px.unit0, px.usd1, px.unit1);
+                if (_reaches(e.vetoPool, K.VD4_TICKS, K.FULL_SIZE_DEPTH_USD, u0, n0, u1, n1)) return K.FULL_SIZE_DEPTH_USD;
+                return _v3SourceUsd(e.vetoPool, e.vetoFlip, px);
+            }
+            if (_pathReaches(e, c0, px)) return K.FULL_SIZE_DEPTH_USD;
+            (v,,) = _pathDepth(e, c0, px);
+            return v;
+        }
+        if (k == K.SRC_NC_V3SAME || k == K.SRC_NC_V3DERIVED) {
+            // the hard feed sits on the side that is not X
+            (int24 a, uint256 usdH) = _ncV3Anchor(e, n, n.ncIs0 ? e.feed1 : e.feed0, n.ncIs0);
+            return _ncV3Usd(e, n, _ncPx(e, n.ncIs0, a, usdH));
+        }
+        return type(uint256).max;
+    }
+
+    /**
+     * @dev True when the depth measure of a pool over `span` ticks, min(fac · W, W_cap) with fac = min(1, L_tw / L), is
+     *      proven to reach `usd`. One walk with the segments clipped to L_tw stops as soon as each direction holds
+     *      need = usd / fac in value: then W_cap >= need >= usd, and since W >= W_cap also fac · W >= usd. False means
+     *      "not proven", never "below": the caller then measures in full. L = 0 is never proven (fac = 0). (u0, n0) and
+     *      (u1, n1): USD answer and unit of the pool's token0 and token1.
+     */
+    function _reaches(address pool, int24 span, uint256 usd, uint256 u0, uint256 n0, uint256 u1, uint256 n1)
+        internal
+        view
+        returns (bool)
+    {
+        (uint160 sp, int24 tick,,,,,) = IGoatV3PoolObserve(pool).slot0();
+        uint128 lNow = IGoatV3PoolDepth(pool).liquidity();
+        uint256 lTw = _lTw(pool);
+        if (u0 == 0 || u1 == 0 || lNow == 0 || lTw == 0) return false;
+        uint256 need = lNow > lTw ? FullMath.mulDivRoundingUp(usd, lNow, lTw) : usd;
+        uint256 stop0 = FullMath.mulDivRoundingUp(need, n0 * 1e8, u0);
+        uint256 stop1 = FullMath.mulDivRoundingUp(need, n1 * 1e8, u1);
+        Walk memory w = Walk(false, pool, 0, IGoatV3PoolDepth(pool).tickSpacing(), lTw, span, stop0, stop1);
+        (uint256 down0, uint256 up1) = _walk(w, sp, tick, lNow);
+        return down0 >= stop0 && up1 >= stop1;
+    }
+
+    /// @dev CL_V3DERIVED: true when both legs hold at least 2 x `FULL_SIZE_DEPTH_USD` over ±50 ticks. Then each leg's VD50
+    ///      and VD4 are at least that (a longer walk only adds), so VD4_1 * VD4_2 / (VD4_1 + VD4_2) >= `FULL_SIZE_DEPTH_USD`
+    ///      and the path depth `_pathDepth` is too. False means "not proven".
+    function _pathReaches(PairEntry memory e, address c0, Px memory px) internal view returns (bool) {
+        address q = _pathQuote(e.vetoPool, c0);
+        uint256 usdQ = _answer(q == K.USDG ? K.USDG_USD_FEED : K.ETH_USD_FEED);
+        uint256 unitQ = 10 ** _decimals(q);
+        return _legReaches(e.vetoPool, !e.vetoFlip, px.usd0, px.unit0, usdQ, unitQ)
+            && _legReaches(e.vetoPool2, e.vetoFlip2, px.usd1, px.unit1, usdQ, unitQ);
+    }
+
+    function _legReaches(address pool, bool xIs0, uint256 usdX, uint256 unitX, uint256 usdQ, uint256 unitQ)
+        internal
+        view
+        returns (bool)
+    {
+        (uint256 u0, uint256 n0, uint256 u1, uint256 n1) = xIs0 ? (usdX, unitX, usdQ, unitQ) : (usdQ, unitQ, usdX, unitX);
+        return _reaches(pool, K.VD4_LEG_TICKS, 2 * K.FULL_SIZE_DEPTH_USD, u0, n0, u1, n1);
     }
 
     /// @notice Depths of an NC row (USD; no threshold, no usability checks) and the anchor used to measure them.
@@ -679,42 +819,58 @@ contract GoatV4SourceMeter {
         view
         returns (Px memory px, uint256 srcUsd, int24 a)
     {
-        uint256 usdH = _answer(cfg.hardFeed.feed);
-        px.unit0 = 10 ** e.dec0;
-        px.unit1 = 10 ** e.dec1;
+        uint256 usdH;
         // a: the pair tick, log(c1 raw / c0 raw)
         if (e.srcKind == K.SRC_NC_POKE) {
+            usdH = _answer(cfg.hardFeed.feed);
             PokeWindow memory w = POKE_ORACLE.consult(cfg.pokePool);
             if (strict) _pokeCalm(w, cfg.pokePool, cfg.gate);
             a = w.medMid;
         } else {
             if (strict) _v3SourceUsable(e.vetoPool, cfg.gate);
-            // TWAP900 in the source orientation (V3SAME: the pair orientation; V3DERIVED: log(H′/X)); orient first, then
-            // floor: the same function as the run-time `anchorOf`
-            int24 ts = GoatAnchorLib.twapTick(e.vetoPool, K.VETO_WINDOW, e.vetoFlip);
-            if (e.srcKind == K.SRC_NC_V3SAME) {
-                a = ts;
-            } else {
-                uint256 usdS = _answer(n.srcFeed);
-                (, int24 tf) = GoatAnchorLib.pairSqrtPrice(usdS, usdH, n.srcDec, cfg.ncIs0 ? e.dec1 : e.dec0);
-                int256 t = int256(ts) + int256(tf); // log(H raw / X raw)
-                a = int24(cfg.ncIs0 ? t : -t);
-            }
+            (a, usdH) = _ncV3Anchor(e, n, cfg.hardFeed.feed, cfg.ncIs0);
         }
         if (strict && (a > K.NC_MAX_ABS_TICK || a < -K.NC_MAX_ABS_TICK)) revert SourceUnusable(R_EXTREME);
-        // pair price: the hard side from the feed; the X leg is converted per amount into the hard token with the anchor
-        // (X's unit price is never rounded, `_legUsd`)
-        (px.nc, px.ncIs0, px.a) = (true, cfg.ncIs0, a);
-        if (cfg.ncIs0) px.usd1 = usdH;
-        else px.usd0 = usdH;
+        px = _ncPx(e, cfg.ncIs0, a, usdH);
         // source VD4
-        if (e.srcKind == K.SRC_NC_POKE) {
-            srcUsd = _pokeDepthUsd(c0, c1, cfg.pokePool, cfg.pools, px);
-        } else if (e.srcKind == K.SRC_NC_V3SAME) {
-            srcUsd = _v3SourceUsd(e.vetoPool, e.vetoFlip, px);
+        if (e.srcKind == K.SRC_NC_POKE) srcUsd = _pokeDepthUsd(c0, c1, cfg.pokePool, cfg.pools, px);
+        else srcUsd = _ncV3Usd(e, n, px);
+    }
+
+    /// @dev NC v3 kinds: the anchor tick `a` (pair orientation) and the hard feed's answer. TWAP900 in the source
+    ///      orientation (V3SAME: the pair orientation; V3DERIVED: log(H′/X)); orient first, then floor: the same
+    ///      function as the run-time `anchorOf`.
+    function _ncV3Anchor(PairEntry memory e, NcSource memory n, address hardFeed, bool ncIs0)
+        internal
+        view
+        returns (int24 a, uint256 usdH)
+    {
+        usdH = _answer(hardFeed);
+        int24 ts = GoatAnchorLib.twapTick(e.vetoPool, K.VETO_WINDOW, e.vetoFlip);
+        if (e.srcKind == K.SRC_NC_V3SAME) {
+            a = ts;
         } else {
-            srcUsd = _derivedSourceUsd(e.vetoPool, e.vetoFlip, n);
+            uint256 usdS = _answer(n.srcFeed);
+            (, int24 tf) = GoatAnchorLib.pairSqrtPrice(usdS, usdH, n.srcDec, ncIs0 ? e.dec1 : e.dec0);
+            int256 t = int256(ts) + int256(tf); // log(H raw / X raw)
+            a = int24(ncIs0 ? t : -t);
         }
+    }
+
+    /// @dev NC pair price: the hard side from the feed; the X leg is converted per amount into the hard token with the
+    ///      anchor (X's unit price is never rounded, `_legUsd`).
+    function _ncPx(PairEntry memory e, bool ncIs0, int24 a, uint256 usdH) internal pure returns (Px memory px) {
+        px.unit0 = 10 ** e.dec0;
+        px.unit1 = 10 ** e.dec1;
+        (px.nc, px.ncIs0, px.a) = (true, ncIs0, a);
+        if (ncIs0) px.usd1 = usdH;
+        else px.usd0 = usdH;
+    }
+
+    /// @dev Source VD4 (USD) of an NC v3 kind: V3SAME at the pair price, V3DERIVED on the X/H′ pool.
+    function _ncV3Usd(PairEntry memory e, NcSource memory n, Px memory px) internal view returns (uint256) {
+        if (e.srcKind == K.SRC_NC_V3SAME) return _v3SourceUsd(e.vetoPool, e.vetoFlip, px);
+        return _derivedSourceUsd(e.vetoPool, e.vetoFlip, n);
     }
 
     /// @dev VD4 of a V3DERIVED source, the X/H′ pool: the H′ leg is valued with the H′ feed, the X leg is converted into
@@ -900,7 +1056,8 @@ contract GoatV4SourceMeter {
     }
 
     /// @dev POKE source: window 15/15 registered, spread <= G, calm |spot − medMid| <= G, VD4 = min(fac · W, W_cap)
-    ///      (fac = min(1, minL / L), W_cap = the walk with segments clipped to minL; see the contract header).
+    ///      (fac = min(1, minL / L), W_cap = the walk with segments clipped to minL; see the contract header), at least
+    ///      `MIN_POKE_SOURCE_DEPTH_USD`. Returns that VD4.
     function _pokeSourceUsable(
         address c0,
         address c1,
@@ -908,9 +1065,10 @@ contract GoatV4SourceMeter {
         PoolSpec[] memory pools,
         int24 g,
         Px memory px
-    ) internal view {
+    ) internal view returns (uint256 srcUsd) {
         _pokeCalm(POKE_ORACLE.consult(pokePool), pokePool, g);
-        if (_pokeDepthUsd(c0, c1, pokePool, pools, px) < K.MIN_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
+        srcUsd = _pokeDepthUsd(c0, c1, pokePool, pools, px);
+        if (srcUsd < K.MIN_POKE_SOURCE_DEPTH_USD) revert SourceUnusable(R_DEPTH);
     }
 
     /// @dev POKE source listing conditions: window 15/15 registered, spread <= G and calm listing |v4 spot − medMid| <= G.
@@ -933,7 +1091,7 @@ contract GoatV4SourceMeter {
         return _min(_fac(_minUsd(down0, false, up1, true, px), minL, lNow), _minUsd(cDown, false, cUp, true, px));
     }
 
-    /// @dev Each exec pool: ±100-tick walk >= $500 (K.MIN_POOL_FILL_USD), valued at the pair price.
+    /// @dev Each exec pool: ±100-tick walk >= $250 (K.MIN_POOL_FILL_USD), valued at the pair price.
     function _checkExecPools(address c0, address c1, PoolSpec[] memory pools, Px memory px) internal view {
         for (uint256 i; i < pools.length; ++i) {
             if (_poolWalkUsd(c0, c1, pools[i], px) < K.MIN_POOL_FILL_USD) revert SourceUnusable(R_POOL_WALK);

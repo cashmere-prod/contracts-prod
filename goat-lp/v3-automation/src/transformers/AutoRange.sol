@@ -6,8 +6,12 @@
 // between spot and anchor before the swap and at mint, and a minimum output from the anchor price net of the pool fee;
 // the swap must be the one the new range needs (direction and amount within a band computed on chain); swaps go through
 // the Universal Router only, with route, depth and swap-budget checks. Fixed 0.15% range fee that can only be lowered;
-// the config is bound to the owner who wrote it; owed tokens are collected to the owner first; the new position is
-// minted directly to the owner; vaults and the combined autoCompound are disabled; pause and nonReentrant.
+// the config is bound to the owner who wrote it; its fees are collected to the owner first; the new position is
+// minted directly to the owner; vaults and the combined autoCompound are disabled; pause and nonReentrant. A rule
+// needs the owner's approval for all positions, since every move mints a new position; ruleOf reads a rule in one call.
+// A move may run in pieces (executePiece): every check of a whole move runs on each piece, the room and the budgets are
+// charged with the principal it removes, and a piece adds to the position the earlier pieces went to while it holds
+// (_destHolds), else mints a new centred one; configTokens writes or clears a rule on many positions in one call.
 // Goat: pragma pinned to the compiler of the deployed build (solc 0.8.24)
 pragma solidity 0.8.24;
 
@@ -28,6 +32,18 @@ import "../goat/GoatRobinhood.sol";
 // Goat: ReentrancyGuard now comes from Automator (Revert: "Transformer, Automator, ReentrancyGuard")
 contract AutoRange is Transformer, Automator, GoatRobinhood {
     event RangeChanged(uint256 indexed oldTokenId, uint256 indexed newTokenId);
+    // Goat: a piece of a move: the liquidity taken from the old position and left in it (0 = this piece emptied it),
+    // whether this piece minted newTokenId, and whether it opened the move (the old position had no link before it).
+    // RangeChanged keeps its meaning: a run that empties the old position and mints the new one in the same tx.
+    event RangePiece(
+        uint256 indexed oldTokenId,
+        uint256 indexed newTokenId,
+        address indexed owner,
+        uint128 liquidityTaken,
+        uint128 liquidityLeft,
+        bool minted,
+        bool opened
+    );
     // Goat: extra execution event (Revert's events are kept as is)
     event GoatRangeExecuted(
         uint256 indexed oldTokenId,
@@ -45,6 +61,8 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
     event RangeFeeUpdated(address account, uint64 feeX64);
     // Goat: vaults are disabled
     error VaultsDisabled();
+    // Goat: an enabling config without the owner's approval for all positions
+    error AllPositionsApprovalRequired();
     event PositionConfigured(
         uint256 indexed tokenId,
         int32 lowerTickLimit,
@@ -164,6 +182,9 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
         uint16 anchorGate;
         IUniswapV3Pool vetoPool;
         uint64 floorX64;
+        // Goat: the liquidity this run takes, and the earlier pieces' position it is added to (0 = a new one)
+        uint128 take;
+        uint256 dest;
     }
 
     // reward handling for autocompound
@@ -174,6 +195,11 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
     // only lower it
     uint64 public constant MAX_RANGE_FEE_X64 = 27670116110564327;
     uint64 public rangeFeeX64 = MAX_RANGE_FEE_X64;
+
+    // Goat: a move in pieces: the position the earlier pieces of a position's move went to (0 = none). Written by a
+    // piece that leaves liquidity behind; deleted by the run that empties the position and by every config write on it.
+    // Appended after rangeFeeX64, so every earlier slot stays where it was.
+    mapping(uint256 => uint256) public pieceDest;
 
     // Goat: minimum width of an active config: W = ud - ld >= max(MIN_RANGE_WIDTH, 2 * (G + ts)). A constant: lowering
     // it needs a new deployment.
@@ -197,6 +223,24 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
     // Goat: whenNotPaused and nonReentrant. executeWithVault does not need them: the vault path is disabled (vaults[]
     // is always empty, so it reverts with Unauthorized), and in Revert's design the vault calls back into execute.
     function execute(ExecuteParams calldata params) external whenNotPaused nonReentrant {
+        ExecuteState memory state;
+        _execute(params, state);
+    }
+
+    /// @notice A piece of a move: takes `liquidity` of the position (all of it at or above the position's liquidity)
+    ///         through every check of execute, and adds it to the position the earlier pieces went to while that one
+    ///         holds (_destHolds: the owner's, with the owner's same rule, same pool and width, the anchor at least G
+    ///         inside both of its edges); else it mints a new position centred on the anchor. The old position keeps
+    ///         its config until it is empty.
+    function executePiece(ExecuteParams calldata params, uint128 liquidity) external whenNotPaused nonReentrant {
+        if (liquidity == 0) revert NotReady();
+        ExecuteState memory state;
+        state.take = liquidity;
+        _execute(params, state);
+    }
+
+    // Goat: state.take is the piece asked for (0 = the whole position)
+    function _execute(ExecuteParams calldata params, ExecuteState memory state) internal {
         _validateExecutionCaller(params.tokenId);
 
         PositionConfig memory config = positionConfigs[params.tokenId];
@@ -215,8 +259,6 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
             revert ExceedsMaxReward();
         }
 
-        ExecuteState memory state;
-
         // Goat: is the owner who wrote the config still the owner? (a transfer invalidates the config)
         state.owner = nonfungiblePositionManager.ownerOf(params.tokenId);
         if (state.owner != positionConfigOwners[params.tokenId]) {
@@ -225,18 +267,19 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
 
         // get position info
         // Goat: tokensOwed is read as well
-        (,, state.token0, state.token1, state.fee, state.tickLower, state.tickUpper, state.liquidity,,, state.owed0, state.owed1) =
-            nonfungiblePositionManager.positions(params.tokenId);
-        // Goat: owed tokens are first collected DIRECTLY to the owner (they never enter this contract, and the fee is
-        // based on the position alone), so dust added to the position by anyone cannot block the move
-        if (state.owed0 != 0 || state.owed1 != 0) {
-            nonfungiblePositionManager.collect(
-                INonfungiblePositionManager.CollectParams(params.tokenId, state.owner, type(uint128).max, type(uint128).max)
-            );
-        }
+        _readPosition(params.tokenId, state);
+        // Goat: the position's fees are first collected DIRECTLY to the owner, on every run: the owed tokens and the
+        // fees accrued since the last update (the collect updates them first). They never enter this contract, so the
+        // move, its fee and its charge to the room and the budgets come from the principal it removes alone, and dust
+        // added to the position by anyone cannot block the move
+        nonfungiblePositionManager.collect(
+            INonfungiblePositionManager.CollectParams(params.tokenId, state.owner, type(uint128).max, type(uint128).max)
+        );
 
+        // Goat: the liquidity this run takes: a piece, or the whole position
+        state.take = state.take == 0 || state.take >= state.liquidity ? state.liquidity : state.take;
         (state.amount0, state.amount1, state.feeAmount0, state.feeAmount1) = _decreaseFullLiquidityAndCollect(
-            params.tokenId, state.liquidity, params.amountRemoveMin0, params.amountRemoveMin1, params.deadline
+            params.tokenId, state.take, params.amountRemoveMin0, params.amountRemoveMin1, params.deadline
         );
 
         // if only fees reward is removed before adding
@@ -308,15 +351,19 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
                     false // Goat: no CONTRACT_BALANCE requirement (AutoRange's amountIn is chosen by the keeper)
                 );
             }
+            // Goat: the range this run adds to, decided before the need band: the link of the earlier pieces while it
+            // holds (_destHolds), else the new range centred on the anchor (_newRange)
+            _newRange(params.tokenId, state, config);
             // Goat: only the needed swap: the operator's direction and effective amount (0 when swapData is empty, as
-            // Swapper then does not swap) must lie in the need band computed on chain for the new anchor-centred range
-            // (above it: Revert's SwapAmountTooLarge; below it, or no swap while one is needed: SwapAmountTooSmall)
-            _checkSwapNeedForNewRange(params.swap0To1, params.swapData.length != 0 ? params.amountIn : 0, state, config);
+            // Swapper then does not swap) must lie in the need band computed on chain for that range (above it:
+            // Revert's SwapAmountTooLarge; below it, or no swap while one is needed: SwapAmountTooSmall)
+            _checkSwapNeedForNewRange(params.swap0To1, params.swapData.length != 0 ? params.amountIn : 0, state);
 
             // Goat: the pair's swap budget (NC rows: leaky bucket; CL rows: unlimited). A move re-mints the WHOLE
-            // principal around the anchor, so every move (with or without a swap) charges the principal of both legs
-            // (token0 to the token0 bucket, token1 to the token1 bucket, each in its own raw units), before the swap
-            // and before other external calls. A closed pair (budget 0) stops swap-less moves too (SwapsOff).
+            // principal it removed around the anchor, so every move or piece (with or without a swap) charges the
+            // principal of both legs it removed (token0 to the token0 bucket, token1 to the token1 bucket, each in its
+            // own raw units), before the swap and before other external calls. A closed pair (budget 0) stops swap-less
+            // moves too (SwapsOff).
             _consumeSwap(state.token0, state.token1, true, state.amount0);
             _consumeSwap(state.token0, state.token1, false, state.amount1);
             // Goat: empty swapData means "no swap" here (as in _checkRoute and the need band above);
@@ -346,19 +393,11 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
             _checkAnchorGate(state.currentTick, state.anchorTick, state.anchorGate);
             state.spotTickAtMint = state.currentTick;
 
-            // Goat: the new range is centred on the anchor, rounded to the nearest tick spacing (the spot is not used
-            // for the centre)
-            (int32 newLower, int32 newUpper) = _rangeFromAnchor(
-                state.anchorTick, config.lowerTickDelta, config.upperTickDelta, _getTickSpacing(state.fee)
-            );
-
-            // Goat: SameRange compares with the new anchor-centred range (Revert: baseTick + delta)
-            if (newLower == state.tickLower && newUpper == state.tickUpper) {
+            // Goat: SameRange compares the old range with the range this run adds to (_newRange: the anchor-centred
+            // range, or the link's; Revert: baseTick + delta)
+            if (state.newTickLower == state.tickLower && state.newTickUpper == state.tickUpper) {
                 revert SameRange();
             }
-            // Goat: the anchor-centred range is stored in state
-            state.newTickLower = SafeCast.toInt24(newLower); // reverts if out of valid range
-            state.newTickUpper = SafeCast.toInt24(newUpper); // reverts if out of valid range
 
             // max amount to add - removing max potential fees (if config.onlyFees - the have been removed already)
             state.maxAddAmount0 = config.onlyFees ? state.amount0 : state.amount0 * Q64 / (params.rewardX64 + Q64);
@@ -370,7 +409,7 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
                 address(state.token0),
                 address(state.token1),
                 state.fee,
-                // Goat: anchor-centred range
+                // Goat: anchor-centred range (used only when no link holds: state.dest == 0)
                 state.newTickLower,
                 state.newTickUpper,
                 state.maxAddAmount0,
@@ -386,8 +425,19 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
             SafeERC20.safeIncreaseAllowance(IERC20(state.token0), address(nonfungiblePositionManager), state.maxAddAmount0);
             SafeERC20.safeIncreaseAllowance(IERC20(state.token1), address(nonfungiblePositionManager), state.maxAddAmount1);
 
-            // Goat: mint is done directly to the owner - it is not a safemint (no onERC721Received callback)
-            (state.newTokenId,, state.amountAdded0, state.amountAdded1) = nonfungiblePositionManager.mint(mintParams);
+            // Goat: mint is done directly to the owner - it is not a safemint (no onERC721Received callback). A piece
+            // whose link holds adds to it instead (NPM lets anyone add: _destHolds is the guard)
+            if (state.dest == 0) {
+                (state.newTokenId,, state.amountAdded0, state.amountAdded1) = nonfungiblePositionManager.mint(mintParams);
+            } else {
+                state.newTokenId = state.dest;
+                (, state.amountAdded0, state.amountAdded1) = nonfungiblePositionManager.increaseLiquidity(
+                    INonfungiblePositionManager.IncreaseLiquidityParams(
+                        state.dest, state.maxAddAmount0, state.maxAddAmount1, params.amountAddMin0, params.amountAddMin1,
+                        params.deadline
+                    )
+                );
+            }
 
             // remove remaining approval
             SafeERC20.safeApprove(IERC20(state.token0), address(nonfungiblePositionManager), 0);
@@ -417,29 +467,27 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
             // Goat: checks-effects-interactions: config writes, deletes and events happen BEFORE the payout to the
             // owner
             // copy token config for new token
-            positionConfigs[state.newTokenId] = config;
-            // Goat: config owner
-            positionConfigOwners[state.newTokenId] = state.owner;
-            emit PositionConfigured(
-                state.newTokenId,
-                config.lowerTickLimit,
-                config.upperTickLimit,
-                config.lowerTickDelta,
-                config.upperTickDelta,
-                config.token0SlippageX64,
-                config.token1SlippageX64,
-                config.onlyFees,
-                config.autoCompound,
-                config.maxRewardX64
-            );
+            // Goat: only to a newly minted position (the link of the earlier pieces keeps its own, never rewritten)
+            if (state.dest == 0) {
+                positionConfigs[state.newTokenId] = config;
+                // Goat: config owner
+                positionConfigOwners[state.newTokenId] = state.owner;
+                emit PositionConfigured(
+                    state.newTokenId,
+                    config.lowerTickLimit,
+                    config.upperTickLimit,
+                    config.lowerTickDelta,
+                    config.upperTickDelta,
+                    config.token0SlippageX64,
+                    config.token1SlippageX64,
+                    config.onlyFees,
+                    config.autoCompound,
+                    config.maxRewardX64
+                );
+            }
 
-            // delete config for old position
-            delete positionConfigs[params.tokenId];
-            // Goat: config owner
-            delete positionConfigOwners[params.tokenId];
-            emit PositionConfigured(params.tokenId, 0, 0, 0, 0, 0, 0, false, false, 0);
-
-            emit RangeChanged(params.tokenId, state.newTokenId);
+            // Goat: the old position's config, the link and the move events (_endRun)
+            _endRun(params.tokenId, state);
             // Goat: execution details
             emit GoatRangeExecuted(
                 params.tokenId,
@@ -531,6 +579,43 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
     // it needs to have approvals set for this contract beforehand
     // Goat: nonReentrant
     function configToken(uint256 tokenId, address vault, PositionConfig calldata config) external nonReentrant {
+        _configToken(tokenId, vault, config);
+    }
+
+    /// @notice Stop (the zero config) or Change (a new config) on every listed position of a rule in one transaction,
+    ///         each through every check of configToken; any listed position that fails them reverts the whole batch. A
+    ///         position with no active rule (emptied by the last piece of a move, already stopped, never configured) is
+    ///         skipped, so a list read a moment earlier never fails and such a position never gets a rule again.
+    function configTokens(uint256[] calldata tokenIds, address vault, PositionConfig calldata config)
+        external
+        nonReentrant
+    {
+        for (uint256 i; i < tokenIds.length; ++i) {
+            PositionConfig storage c = positionConfigs[tokenIds[i]];
+            if (c.lowerTickDelta != c.upperTickDelta) _configToken(tokenIds[i], vault, config);
+        }
+    }
+
+    // Goat: one read of a rule for the site and the keeper: the config, the address that wrote it, the current owner
+    // (address(0) for a burned position), whether this contract is allowed for the position, and its liquidity. The
+    // rule runs only while writer == owner. Never reverts.
+    function ruleOf(uint256 tokenId)
+        external
+        view
+        returns (PositionConfig memory config, address writer, address holder, bool allowed, uint128 liquidity)
+    {
+        config = positionConfigs[tokenId];
+        writer = positionConfigOwners[tokenId];
+        try nonfungiblePositionManager.ownerOf(tokenId) returns (address o) {
+            holder = o;
+        } catch {
+            return (config, writer, address(0), false, 0);
+        }
+        allowed = _allowedFor(tokenId, holder);
+        (,,,,,,, liquidity,,,,) = nonfungiblePositionManager.positions(tokenId);
+    }
+
+    function _configToken(uint256 tokenId, address vault, PositionConfig calldata config) internal {
         _validateOwner(nonfungiblePositionManager, tokenId, vault);
 
         // lower tick must be always below or equal to upper tick - if they are equal - range adjustment is deactivated
@@ -559,11 +644,19 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
             // table's own choice at config time without reading feeds: GoatPairTable.gateFor uses the same rule as
             // anchor(), with no copy here.
             _checkRangeConfig(config, _getTickSpacing(fee), pairTable.gateFor(token0, token1, fee), liquidity);
+            // Goat: every move mints a new position, so a rule keeps running only with the owner's approval for all
+            // positions; an approval for this position alone would end at the first move. Turning a rule off needs no
+            // approval.
+            if (!nonfungiblePositionManager.isApprovedForAll(msg.sender, address(this))) {
+                revert AllPositionsApprovalRequired();
+            }
         }
 
         positionConfigs[tokenId] = config;
         // Goat: ownership was checked by _validateOwner (the vault path is disabled, so the owner is msg.sender)
         positionConfigOwners[tokenId] = msg.sender;
+        // Goat: a config write ends a move in pieces: the next piece of a later rule never adds to the old link
+        delete pieceDest[tokenId];
 
         emit PositionConfigured(
             tokenId,
@@ -630,15 +723,14 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
         revert RenounceOwnershipDisabled();
     }
 
-    // Goat: separate from execute to keep its stack small: the new range (same computation as in execute), the same
-    // floor and the pair's gate
-    function _checkSwapNeedForNewRange(
-        bool swap0To1,
-        uint256 amountIn,
-        ExecuteState memory state,
-        PositionConfig memory config
-    ) internal view {
+    // Goat: the range this run adds to, in state (newTickLower, newTickUpper; dest = the link, 0 = mint), decided before
+    // the need band. First the anchor-centred range and its checks, as every run; then the link of the earlier pieces
+    // replaces it while it holds (_destHolds). Its width is the config's and its ticks are a live position's, so the
+    // width and bound checks below cover it too.
+    function _newRange(uint256 tokenId, ExecuteState memory state, PositionConfig memory config) internal view {
         int24 ts = _getTickSpacing(state.fee);
+        // Goat: the new range is centred on the anchor, rounded to the nearest tick spacing (the spot is not used for
+        // the centre)
         (int32 lo, int32 hi) = _rangeFromAnchor(state.anchorTick, config.lowerTickDelta, config.upperTickDelta, ts);
         // Goat: the minimum width is checked again with the CURRENT gate at execution: the config-time check
         // (_checkRangeConfig) cannot see a gate G raised later (queuePair/addPair, a CL to NC switch, gateHighFee), and
@@ -652,14 +744,28 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
         ) {
             revert InvalidConfig();
         }
+        // Goat: the anchor-centred range is stored in state
+        state.newTickLower = SafeCast.toInt24(lo);
+        state.newTickUpper = SafeCast.toInt24(hi);
+        // Goat: a piece goes to the link of the earlier pieces while it holds; then its range is the one added to
+        uint256 d = pieceDest[tokenId];
+        if (d != 0) {
+            (bool holds, int24 dLo, int24 dHi) = _destHolds(d, state, config);
+            if (holds) (state.dest, state.newTickLower, state.newTickUpper) = (d, dLo, dHi);
+        }
+    }
+
+    // Goat: separate from execute to keep its stack small: the need band on the range this run adds to (_newRange), the
+    // same floor and the pair's gate
+    function _checkSwapNeedForNewRange(bool swap0To1, uint256 amountIn, ExecuteState memory state) internal pure {
         _checkSwapNeed(
             GoatNeed(
                 swap0To1,
                 amountIn,
                 state.amount0,
                 state.amount1,
-                SafeCast.toInt24(lo),
-                SafeCast.toInt24(hi),
+                state.newTickLower,
+                state.newTickUpper,
                 state.anchorTick,
                 state.anchorSqrtPriceX96,
                 state.anchorGate,
@@ -668,12 +774,39 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
         );
     }
 
+    // Goat: the end of a run, after the add and before the payout. A run that empties the old position deletes its
+    // config and its link; it keeps the whole-move shape (RangeChanged) only when it minted the new position, else it is
+    // the emptying piece into the link (RangePiece, left 0, minted false). A piece that leaves liquidity keeps the old
+    // config and points the link at the position it added to. `opened`: the old position had no link before this run.
+    function _endRun(uint256 tokenId, ExecuteState memory state) internal {
+        bool opened = pieceDest[tokenId] == 0;
+        if (state.take == state.liquidity) {
+            // delete config for old position
+            delete positionConfigs[tokenId];
+            // Goat: config owner
+            delete positionConfigOwners[tokenId];
+            // Goat: and the link
+            delete pieceDest[tokenId];
+            emit PositionConfigured(tokenId, 0, 0, 0, 0, 0, 0, false, false, 0);
+            if (state.dest == 0) {
+                emit RangeChanged(tokenId, state.newTokenId);
+            } else {
+                emit RangePiece(tokenId, state.newTokenId, state.owner, state.take, 0, false, opened);
+            }
+        } else {
+            pieceDest[tokenId] = state.newTokenId;
+            emit RangePiece(
+                tokenId, state.newTokenId, state.owner, state.take, state.liquidity - state.take, state.dest == 0, opened
+            );
+        }
+    }
+
     // Goat: bounds of an active config, in one place (InvalidConfig on any violation):
     //   0 <= lowerTickLimit, upperTickLimit <= type(uint24).max (the readiness arithmetic cannot overflow)
     //   |ld + ud| <= ts: with W >= 2 * ts this gives ld <= -ts/2 < 0 < ts/2 <= ud, so the new range contains the anchor
     //   W = ud - ld is a multiple of ts (otherwise the upper tick is misaligned and every mint reverts)
     //   W >= max(MIN_RANGE_WIDTH, 2 * (G + ts)), with G the pair's gate at config time (the need band cannot collapse);
-    //     G can rise later, so execution checks the same minimum with the current G (_checkSwapNeedForNewRange);
+    //     G can rise later, so execution checks the same minimum with the current G (_newRange);
     //     G = 0 (the table does not cover this fee tier) -> InvalidConfig
     //   W <= 2 * MAX_TICK (_rangeFromAnchor cannot overflow int32). This does not prove the range is mintable: when the
     //     anchor is far from tick 0, a very wide range can cross the tick bounds; execution then reverts with
@@ -715,7 +848,7 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
         }
     }
 
-    // Goat: binds the pair table once (it cannot change later; the table's rows change under its own 24 h timelock);
+    // Goat: binds the pair table once (it cannot change later; the table's rows change under its own 1 h timelock);
     // onlyOwner, then nonReentrant
     function setPairTable(GoatPairTable table) external onlyOwner nonReentrant {
         _setPairTable(table);
@@ -736,6 +869,41 @@ contract AutoRange is Transformer, Automator, GoatRobinhood {
             }
             return spacing;
         }
+    }
+
+    // Goat: the position read of execute, in its own frame (keeps execute's stack small)
+    function _readPosition(uint256 tokenId, ExecuteState memory state) internal view {
+        (,, state.token0, state.token1, state.fee, state.tickLower, state.tickUpper, state.liquidity,,, state.owed0, state.owed1) =
+            nonfungiblePositionManager.positions(tokenId);
+    }
+
+    // Goat: the link `d` may take this piece (it holds) when all of these are true: its config was written by the
+    // owner with the very same rule as the old position (the whole PositionConfig, so a rule the owner rewrote on it
+    // never takes a piece); it is still the owner's (a burned id reads as not); same pool (token0, token1, fee); the
+    // rule's width; and the gate band inside it: lower + G <= anchor and upper - G >= anchor. Every centred range meets
+    // the band (W >= 2 * (G + ts)), and the need band is written for exactly such ranges. Returns the link's ticks.
+    function _destHolds(uint256 d, ExecuteState memory state, PositionConfig memory config)
+        internal
+        view
+        returns (bool holds, int24 lo, int24 hi)
+    {
+        if (positionConfigOwners[d] != state.owner) return (false, 0, 0);
+        PositionConfig memory dc = positionConfigs[d];
+        if (keccak256(abi.encode(dc)) != keccak256(abi.encode(config))) return (false, 0, 0);
+        try nonfungiblePositionManager.ownerOf(d) returns (address o) {
+            if (o != state.owner) return (false, 0, 0);
+        } catch {
+            return (false, 0, 0);
+        }
+        address t0;
+        address t1;
+        uint24 fee;
+        (,, t0, t1, fee, lo, hi,,,,,) = nonfungiblePositionManager.positions(d);
+        if (t0 != state.token0 || t1 != state.token1 || fee != state.fee) return (false, 0, 0);
+        if (int256(hi) - int256(lo) != int256(config.upperTickDelta) - int256(config.lowerTickDelta)) return (false, 0, 0);
+        int256 g = int256(uint256(state.anchorGate));
+        int256 a = state.anchorTick;
+        holds = int256(lo) + g <= a && int256(hi) - g >= a;
     }
 
     function _validateExecutionCaller(uint256 tokenId) internal view {

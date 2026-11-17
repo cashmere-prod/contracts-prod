@@ -78,10 +78,12 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
  *      canonical v4 pool hook has the before-swap flag but no add or remove liquidity flags, so collect and
  *      increase never call it; in other pools the hook is untrusted code (see the note below). With an anchor,
  *      or a caller reference, a rebalancing swap runs in the position's own pool (`_swapToRatio`) and does call
- *      that pool's hook. When spot is inside the gate but on the unfavourable side of the anchor, the swap is
- *      skipped.
+ *      that pool's hook. When spot is inside the gate but so far on the unfavourable side of the anchor that the
+ *      swap floor (the anchor price less the fees and the slippage tolerance) cannot be met at spot, the swap is
+ *      skipped; a smaller unfavourable gap, inside the tolerance, still swaps.
  *
- *      One-sided fees: when no swap is possible (no anchor, unfavourable spot, pool fee above 10%) and the
+ *      One-sided fees: when no swap is possible (no anchor, a spot beyond the tolerance on the unfavourable side,
+ *      pool fee above 10%) and the
  *      liquidity to add is 0, the call reverts with `NothingToCompound` rather than handing the collected fees
  *      back free of charge; the owner can use claim mode or collect on Uniswap. On a partial match the unmatched
  *      remainder is returned without a fee.
@@ -685,7 +687,7 @@ contract GoatV4Compoundor is Ownable2Step, ReentrancyGuard, IUnlockCallback {
      * If it is available and spot is outside the gate, the compound reverts with "price manipulated".
      *
      * Anchor sources: Chainlink when both tokens have a feed, otherwise the single v3 pool the owner assigned to
-     * the pair after a 24-hour public wait. The factory is never scanned, so an unassigned pool cannot become the
+     * the pair after a 1-hour public wait. The factory is never scanned, so an unassigned pool cannot become the
      * anchor. A Chainlink anchor goes quiet only when a feed is older than its age limit; an assigned pool when it
      * has not traded for 6 hours or its depth is below `minDepth`.
      *

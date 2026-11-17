@@ -127,6 +127,8 @@ contract GoatAutoCompoundV3 is Ownable, ReentrancyGuard {
     /// @notice Performance fee as a Q64 fraction, 10% (Q64 / 10) at deployment. Keepers cannot change it.
     uint64 public totalRewardX64 = 1844674407370955161;
     /// @notice Upper limit of the fee (10%). The fee can only be lowered, never raised.
+    /// @dev No code reads it: the fee starts at this value and `setReward` only lowers it, so the limit holds by
+    /// construction; it stays as a public value for readers.
     uint64 public constant MAX_REWARD_X64 = 1844674407370955161;
 
     /// @dev TWAP window: 1800 s. On Robinhood Chain a 60 s window usually holds no new observation
@@ -148,6 +150,7 @@ contract GoatAutoCompoundV3 is Ownable, ReentrancyGuard {
     uint16 public constant MAX_SLIPPAGE_BPS = 500; // 5%
     uint32 public constant MIN_INTERVAL = 3600; // 1 hour: minimum time between runs of a position
 
+    /// @notice The position manager's WETH9, kept as a public value for readers; no code of this contract reads it.
     address public immutable weth;
     IUniswapV3Factory public immutable factory;
     INonfungiblePositionManager public immutable nonfungiblePositionManager;
@@ -163,7 +166,7 @@ contract GoatAutoCompoundV3 is Ownable, ReentrancyGuard {
     mapping(address => bool) public operators;
 
     /// @notice Queued changes wait TIMELOCK and must then be applied within QUEUE_GRACE.
-    uint256 public constant TIMELOCK = 24 hours;
+    uint256 public constant TIMELOCK = 1 hours;
     uint256 public constant QUEUE_GRACE = 7 days;
     /// @notice queue id (bound to the owner that queued it: a new owner cannot apply it; it counts again only if that
     ///         same address becomes owner again inside the grace window) -> queue timestamp.
@@ -835,7 +838,7 @@ contract GoatAutoCompoundV3 is Ownable, ReentrancyGuard {
      * is not usable; the real remedy is to grow that pool's observation buffer
      * (`increaseObservationCardinalityNext`, callable by anyone).
      * The outside price (step 2) comes only from Chainlink or from a pool the anchor owner assigned
-     * with a 24 hour delay (`GoatPriceAnchor`); the factory is not scanned.
+     * with a 1 hour delay (`GoatPriceAnchor`); the factory is not scanned.
      * The no-check path is also used when a source exists but is not usable at the moment.
      */
     /// @return src price source used (SRC_*). The result is written to `s`: `s.floorSqrtP` is the sqrt price the swap minimum is based on (0 = no swap),
@@ -882,7 +885,7 @@ contract GoatAutoCompoundV3 is Ownable, ReentrancyGuard {
          * rarely.
          *
          * So the check falls back to the outside price: `GoatPriceAnchor` returns Chainlink or a pool its
-         * owner assigned with a 24 hour delay, a stronger reference; the factory is not scanned.
+         * owner assigned with a 1 hour delay, a stronger reference; the factory is not scanned.
          */
         (bool aOk, uint160 aSqrt, int24 anchorTick) = _anchorFor(s, address(pool));
         if (aOk) {

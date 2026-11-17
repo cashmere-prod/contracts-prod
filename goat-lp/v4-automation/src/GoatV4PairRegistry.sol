@@ -13,6 +13,7 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {GoatAnchorLib} from "./lib/GoatAnchorLib.sol";
 import {GoatV4Constants as K} from "./lib/GoatV4Constants.sol";
 import {GoatPonsV2Terms} from "./lib/GoatPonsV2Terms.sol";
+import {GoatVersionRule} from "./lib/GoatVersionRule.sol";
 import {
     PoolSpec, PairConfig, NcPairConfig, PairEntry, NcSource, SwapBudget, NcSlow, HookEntry
 } from "./lib/GoatPairTypes.sol";
@@ -44,6 +45,11 @@ interface IGoatStewardBindRef {
  *      withdraw-only pair (`ExitOnlyPair`). NC rows have a per-pair budget for swap flows (two buckets: the hard leg H
  *      and the X leg, each in its own raw units, refilled over 3,600 s); the founding default is UNLIMITED, and the
  *      guardian can lower it to a finite cap at any time. On CL rows the budget is only an ON (unlimited) / OFF (0) switch.
+ *      Every row with a v3 source (CL_V3, CL_V3DERIVED, NC_V3SAME, NC_V3DERIVED) also has a DEPTH ROOM: with
+ *      D = min(source depth measured at listing, live source depth), while D < $4,000 operator swap flows of the pair
+ *      move at most D / 4 (USD at the anchor) per 15 minutes (`consumeDepthRoom`); at $4,000 or more there is no such
+ *      limit. It follows the pool by itself: no owner step, no pair-wide stop. `refreshDepth`, open to anyone, lifts the
+ *      depth at listing once a higher depth has held for `DEPTH_HOLD` (24 h, so a short-lived deposit cannot lift it).
  *
  * @dev Every NC row has a SLOW REFERENCE (SR, the "price speed limit"). The SR follows the source's TWAP900 by at most
  *      `rate` ticks per hour (on V3 kinds only while TWAP60, TWAP10 and spot are within G of TWAP900; on POKE the target
@@ -51,9 +57,11 @@ interface IGoatStewardBindRef {
  *      (`VetoSlowFar`). Anyone can poke it; the step is counted on the absolute hour grid, so extra pokes neither speed
  *      it up nor slow it down, and a gap between pokes beyond `SR_MAX_DT` is forfeited. CL rows have no SR.
  *
- * @dev Governance: listing (add or change) waits for the 24-hour timelock, and the meter checks the chain AGAIN at
- *      apply; founding rows are seeded by the owner before the seal (every row passes the meter). REMOVAL, pool removal,
- *      queue cancellation and budget LOWERING are immediate (owner or guardian); a budget RAISE needs the owner and 24 h.
+ * @dev Governance: listing (add or change) waits for the 1-hour timelock, and the meter checks the chain AGAIN at
+ *      apply; founding rows are seeded by the owner before the seal (every row passes the meter). The pair VERSION is
+ *      kept when a listed row is written again with the same price source and no looser limit (`GoatVersionRule`), and
+ *      when a removed row is listed again exactly as before; any other change bumps it. REMOVAL, pool removal,
+ *      queue cancellation and budget LOWERING are immediate (owner or guardian); a budget RAISE needs the owner and 1 h.
  *
  * @dev Fail-closed: every defect of the anchor read reverts (`NoAnchor`, `NcTwapUnavailable`, `PokeHistoryGap`,
  *      `PokeSpreadWide`); a defect of the source checks reverts `AnchorVetoed` / `VetoTwapFar` / `VetoSpotFar`.
@@ -74,13 +82,19 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     uint32 public constant MAX_FEED_AGE = K.MAX_FEED_AGE;
     uint64 public constant BAD_ROUND_CEILING = K.BAD_ROUND_CEILING;
     uint32 public constant MIN_POOL_FILL_USD = K.MIN_POOL_FILL_USD;
+    uint32 public constant MAX_FEED_AGE_USDG = K.MAX_FEED_AGE_USDG;
+    uint256 public constant FULL_SIZE_DEPTH_USD = K.FULL_SIZE_DEPTH_USD;
+    uint256 public constant DEPTH_ROOM_BPS = K.DEPTH_ROOM_BPS;
+    uint256 public constant DEPTH_ROOM_WINDOW = K.DEPTH_ROOM_WINDOW;
+    /// @notice The depth at listing can rise by itself once a higher depth has held this long (`refreshDepth`).
+    uint256 public constant DEPTH_HOLD = 24 hours;
     int24 public constant NC_MAX_ABS_TICK = K.NC_MAX_ABS_TICK;
     /// @notice A budget bucket drains its whole `cap` burst over this many seconds.
     uint256 public constant SWAP_CAP_WINDOW = 3600;
     /// @notice "UNLIMITED" budget (no accounting): the open state of CL rows; on NC rows the owner's choice of no budget limit.
     uint128 public constant CAP_UNLIMITED = type(uint128).max;
     uint256 internal constant SEQUENCER_GRACE = 600;
-    uint256 internal constant TIMELOCK = 24 hours;
+    uint256 internal constant TIMELOCK = 1 hours;
     /// @notice A queued action expires after eta + 7 days (inclusive).
     uint256 public constant QUEUE_GRACE = 7 days;
     /// @notice A single `closeMarket` call closes at most 96 hours, and the closure may end at most 168 hours (7 days)
@@ -133,6 +147,20 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         bool offPolicy;
     }
 
+    /// @notice Depth room of a row with a v3 source: the source depth measured at listing (whole USD) and the leaky
+    ///         bucket of operator swap-flow value (8-decimal USD), drained over `DEPTH_ROOM_WINDOW`. One slot.
+    struct DepthRoom {
+        uint64 listUsd;
+        uint128 used8;
+        uint64 at;
+    }
+
+    /// @notice A running hold of `refreshDepth`: the lowest depth read since `since` (whole USD); since = 0: no hold.
+    struct DepthHold {
+        uint64 lowUsd;
+        uint64 since;
+    }
+
     /// @notice Anchor: the pair price (mid), the low / high ticks for the user-favourable floor (they differ only on NC POKE) and the USD view.
     struct Quote {
         uint160 sqrtPriceX96;
@@ -168,7 +196,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     mapping(bytes32 => bytes32) public pokePoolOf;
     /// @notice Swap budget per pair (kept apart from the semantic entry).
     mapping(bytes32 => SwapBudget) public swapBudget;
-    /// @notice Semantic hash (kind, feed rules, gate, source); pools, fill and budget excluded.
+    /// @notice Semantic hash (kind, feed rules, gate, source); pools, fill and budget excluded. Kept after `removePair`,
+    ///         so a row listed again exactly as before keeps its version.
     mapping(bytes32 => bytes32) public semHash;
     mapping(bytes32 => bytes32[]) internal _poolsOf;
     /// @notice Slow reference of an NC row (empty on a CL row).
@@ -196,6 +225,10 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     /// @notice What `_commit` knew about each listed pool's key, for `_anyVenue` (slot 20, appended after the earlier
     ///         layout). Zero = hookless and inside the Steward's static listed-path policy.
     mapping(bytes32 => VenueTag) internal _venueTag;
+    /// @notice Depth room per pair (slot 21, appended): the depth at listing and the bucket of `consumeDepthRoom`.
+    mapping(bytes32 => DepthRoom) public depthRoom;
+    /// @notice Running holds of `refreshDepth` per pair (slot 22, appended).
+    mapping(bytes32 => DepthHold) public depthHold;
 
     // ------------------------------------------------------------------ events
 
@@ -217,6 +250,12 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     event SwapCapQueued(address indexed currency0, address indexed currency1, uint128 cap, uint128 capX, uint256 eta);
     event SwapCapRaised(address indexed currency0, address indexed currency1, uint128 cap, uint128 capX);
     event SwapBudgetUsed(address indexed currency0, address indexed currency1, uint256 valueHard, uint256 valueX);
+    /// @notice An operator swap flow used the depth room (`valueUsd8` = its principal; `depthUsd` = D, the smaller of the
+    ///         depth at listing and the live depth).
+    event DepthRoomUsed(address indexed currency0, address indexed currency1, uint256 valueUsd8, uint256 depthUsd);
+    /// @notice A hold started or its lowest read changed (since = 0: the hold ended without a raise).
+    event DepthHoldSet(address indexed currency0, address indexed currency1, uint256 lowUsd, uint64 since);
+    event DepthRaised(address indexed currency0, address indexed currency1, uint256 listUsdBefore, uint256 listUsd);
     event NcSlowPoked(address indexed currency0, address indexed currency1, int24 twap, int24 slow);
     event SlowRateLowered(address indexed currency0, address indexed currency1, uint16 rate, address by);
     event SlowRateQueued(address indexed currency0, address indexed currency1, uint16 rate, uint256 eta);
@@ -326,7 +365,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         if (c0.length != cfg.length || c1.length != cfg.length) revert BadValue();
         for (uint256 i; i < cfg.length; ++i) {
             if (_entries[pairId(c0[i], c1[i])].gate != 0) revert BadDeployment();
-            _storeCl(c0[i], c1[i], cfg[i], METER.validateCl(c0[i], c1[i], cfg[i]));
+            (PairEntry memory e, uint256 d) = METER.measureCl(c0[i], c1[i], cfg[i]);
+            _storeCl(c0[i], c1[i], cfg[i], e, d);
         }
     }
 
@@ -340,8 +380,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         if (c0.length != cfg.length || c1.length != cfg.length) revert BadValue();
         for (uint256 i; i < cfg.length; ++i) {
             if (_entries[pairId(c0[i], c1[i])].gate != 0) revert BadDeployment();
-            (PairEntry memory e, NcSource memory n) = METER.validateNc(c0[i], c1[i], cfg[i]);
-            _storeNc(c0[i], c1[i], cfg[i], e, n);
+            (PairEntry memory e, NcSource memory n, uint256 d) = METER.measureNc(c0[i], c1[i], cfg[i]);
+            _storeNc(c0[i], c1[i], cfg[i], e, n, d);
         }
     }
 
@@ -357,7 +397,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
 
     // ------------------------------------------------------------------ timelocked listing
 
-    /// @dev Consumes a queue entry: the input hash must match, 24 h must have passed and eta + 7 days must not (inclusive).
+    /// @dev Consumes a queue entry: the input hash must match, 1 h must have passed and eta + 7 days must not (inclusive).
     function _consume(bytes32 q, bytes32 h) internal {
         uint256 t = queuedAt[q];
         if (t == 0 || _pendingHash[q] != h) revert NotQueued();
@@ -372,7 +412,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         eta = block.timestamp + TIMELOCK;
     }
 
-    /// @notice Adding or changing a CL row waits for the 24-hour timelock (the meter runs at queue AND at apply). A pair
+    /// @notice Adding or changing a CL row waits for the 1-hour timelock (the meter runs at queue AND at apply). A pair
     ///         with an NC row cannot be written as CL (`removePair` first).
     function queuePair(address currency0, address currency1, PairConfig calldata cfg) external onlyOwner nonReentrant {
         bytes32 pid = pairId(currency0, currency1);
@@ -386,10 +426,11 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         bytes32 pid = pairId(currency0, currency1);
         _consume(_qid("PAIR", pid), keccak256(abi.encode(cfg)));
         _notKind(pid, true);
-        _storeCl(currency0, currency1, cfg, METER.validateCl(currency0, currency1, cfg));
+        (PairEntry memory e, uint256 d) = METER.measureCl(currency0, currency1, cfg);
+        _storeCl(currency0, currency1, cfg, e, d);
     }
 
-    /// @notice Adding or changing an NC row waits for the 24-hour timelock. A pair with a CL row cannot be written as NC.
+    /// @notice Adding or changing an NC row waits for the 1-hour timelock. A pair with a CL row cannot be written as NC.
     function queueNcPair(address currency0, address currency1, NcPairConfig calldata cfg)
         external
         onlyOwner
@@ -410,8 +451,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         bytes32 pid = pairId(currency0, currency1);
         _consume(_qid("NC", pid), keccak256(abi.encode(cfg)));
         _ncRewrite(pid, cfg.ncIs0);
-        (PairEntry memory e, NcSource memory n) = METER.validateNc(currency0, currency1, cfg);
-        _storeNc(currency0, currency1, cfg, e, n);
+        (PairEntry memory e, NcSource memory n, uint256 d) = METER.measureNc(currency0, currency1, cfg);
+        _storeNc(currency0, currency1, cfg, e, n, d);
     }
 
     /// @dev NC write: a listed CL pair gives `BadPairEntry`; the hard leg (`ncIs0`) of a listed NC row cannot be flipped
@@ -428,15 +469,22 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         return k == K.SRC_NC_V3SAME || k == K.SRC_NC_V3DERIVED || k == K.SRC_NC_POKE;
     }
 
+    /// @dev Kinds with a depth room: a v3 source (CL_V3, CL_V3DERIVED, NC_V3SAME, NC_V3DERIVED). POKE sources keep the
+    ///      $4,000 listing floor and have no depth room; a withdraw-only row has no swap flows.
+    function _roomKind(uint8 k) private pure returns (bool) {
+        return k == K.SRC_CL_V3 || k == K.SRC_CL_V3DERIVED || k == K.SRC_NC_V3SAME || k == K.SRC_NC_V3DERIVED;
+    }
+
     /// @dev `BadPairEntry` if the listed pair is of the other kind (NC while writing CL, CL while writing NC).
     function _notKind(bytes32 pid, bool writingCl) internal view {
         PairEntry storage e = _entries[pid];
         if (e.gate != 0 && _isNc(e.srcKind) == writingCl) revert BadPairEntry();
     }
 
-    /// @notice Immediate (owner or guardian): deletes the entry, the source, the budget and all of the pair's queues. The
-    ///         version counter is kept, so a re-added pair gets a new version. Withdraw-only continues on listed hookless
-    ///         static pools. The hook entry and pending HOOK queue of every pool of the last listing are deleted as well.
+    /// @notice Immediate (owner or guardian): deletes the entry, the source, the budget, the depth room and all of the
+    ///         pair's queues. The version counter and the semantic hash are kept: a pair listed again exactly as before
+    ///         keeps its version, any other re-listing gets a new one. Withdraw-only continues on listed hookless static
+    ///         pools. The hook entry and pending HOOK queue of every pool of the last listing are deleted as well.
     function removePair(address currency0, address currency1) external onlyOwnerOrGuardian nonReentrant {
         bytes32 pid = pairId(currency0, currency1);
         bool listed = _entries[pid].gate != 0;
@@ -448,7 +496,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         delete _nc[pid];
         delete pokePoolOf[pid];
         delete swapBudget[pid];
-        delete semHash[pid];
+        delete depthRoom[pid];
+        delete depthHold[pid];
         delete ncSlow[pid];
         // A no-op removal (nothing listed, nothing queued) emits nothing.
         if (_cancel(pid) || listed) emit PairRemoved(currency0, currency1);
@@ -456,7 +505,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
 
     /// @notice Immediate (owner or guardian): removes one allowed pool from the list. The version does not change. Also
     ///         deletes the pair's PENDING CL/NC listing queue, so a refresh queued earlier with the same hash cannot bring
-    ///         the pool back silently under the same version; listing it again needs a new 24-hour queue. Budget and SR
+    ///         the pool back silently under the same version; listing it again needs a new 1-hour queue. Budget and SR
     ///         queues stay. The pool's hook entry and pending HOOK queue are deleted as well.
     function removePool(bytes32 poolId) external onlyOwnerOrGuardian nonReentrant {
         bytes32 pid = poolListing[poolId].pair;
@@ -512,7 +561,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     }
 
     /// @notice Immediate (owner or registry guardian): HOOK / CODEHASH values only, each scoped to one hook family. TOKEN
-    ///         adds go through `queueRedList` (owner, 24 h). Idempotent. A TOKEN value that is ALREADY listed is accepted
+    ///         adds go through `queueRedList` (owner, 1 h). Idempotent. A TOKEN value that is ALREADY listed is accepted
     ///         (idempotent re-add): it drops a pending TOKEN removal, so the guardian can stop that removal.
     function addRedList(uint8 kind, bytes32 value) external onlyOwnerOrGuardian nonReentrant {
         // A HOOK value is a canonical address (high 96 bits 0, as `checkUnlisted` compares it); a CODEHASH value is never
@@ -526,7 +575,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         _redAdd(kind, value);
     }
 
-    /// @notice Owner, 24 h queue (+7 d grace, inclusive): TOKEN adds (native, WETH and USDG refused) and removals of any
+    /// @notice Owner, 1 h queue (+7 d grace, inclusive): TOKEN adds (native, WETH and USDG refused) and removals of any
     ///         kind. Validated at queue AND at apply (`_redCheck`).
     function queueRedList(uint8 kind, bytes32 value, bool add) external onlyOwner nonReentrant {
         _redCheck(kind, value, add);
@@ -640,14 +689,14 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         emit HookEntryAdded(pid, K.FOUNDING_HOOK, e);
     }
 
-    /// @notice Owner, 24 h queue (+7 d grace), keyed by poolId and bound to the hash of `(key, e)`. Re-queueing a poolId
+    /// @notice Owner, 1 h queue (+7 d grace), keyed by poolId and bound to the hash of `(key, e)`. Re-queueing a poolId
     ///         that already has an entry is the owner's timelocked change; the active entry stays active until apply.
     function queueHookEntry(PoolKey calldata key, HookEntry calldata e) external onlyOwner nonReentrant {
         bytes32 pid = _validateHookEntry(key, e);
         emit HookEntryQueued(pid, address(key.hooks), e, _queue(_qid("HOOK", pid), keccak256(abi.encode(key, e))));
     }
 
-    /// @notice Owner, after 24 h: consumes the exact `(key, e)` hash, then validates AGAIN (the chain may have moved: cap,
+    /// @notice Owner, after 1 h: consumes the exact `(key, e)` hash, then validates AGAIN (the chain may have moved: cap,
     ///         code, listing, bits).
     function applyHookEntry(PoolKey calldata key, HookEntry calldata e) external onlyOwner nonReentrant {
         bytes32 pid = keccak256(abi.encode(key));
@@ -673,7 +722,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     /// @dev Entry lifetime: an entry never outlives its pool's listing. Drops the pool's pending HOOK queue and the entry;
     ///      emits `HookEntryRemoved(id, msg.sender)` when either existed. Called by `removePool`, by `removePair` for every
     ///      id of the pair's last listing, and by the `_commit` branch that drops a pool. A later re-list never revives an
-    ///      entry: it needs a fresh queue -> 24 h -> apply with full validation.
+    ///      entry: it needs a fresh queue -> 1 h -> apply with full validation.
     function _dropHookEntry(bytes32 id) internal {
         // Emits for a dropped pending HOOK queue too (as `removeHookEntry` does), so an observer tracking
         // `HookEntryQueued` never keeps a stale pending queue after `removePool` / `removePair` / a dropping re-list.
@@ -719,7 +768,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         }
         // 7. slippage bound
         if (e.maxSlippageBps < ENTRY_MIN_SLIPPAGE_BPS || e.maxSlippageBps > ENTRY_MAX_SLIPPAGE_BPS) revert BadValue();
-        // 8. depth rule: measured ±100-tick walk at the anchor AND the listed fill, both >= ENTRY_MIN_WALK_USD ($4,000)
+        // 8. depth rule: measured ±100-tick walk at the anchor AND the listed fill, both >= ENTRY_MIN_WALK_USD ($1,000)
         uint256 walk = _walkUsd(c0, c1, pid, key.tickSpacing);
         if (poolListing[pid].fillUsd < ENTRY_MIN_WALK_USD || walk < ENTRY_MIN_WALK_USD) revert EntryTooThin(walk);
         // 9. kind branch
@@ -815,7 +864,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
      * @notice Immediate (owner or guardian; it only NARROWS the service): closes the hours [fromHour, toHour) (ts / 3600).
      *         One call closes at most `MAX_CLOSURE_HOURS`; the end is in the future and at most `MAX_CLOSURE_AHEAD_HOURS`
      *         ahead. During those hours the anchor of every session-bound row reverts `NoAnchor` and the SR of NC rows
-     *         freezes (`_slowFrozen`). The closure ends by itself; reopening early needs the owner and 24 h
+     *         freezes (`_slowFrozen`). The closure ends by itself; reopening early needs the owner and 1 h
      *         (`queueReopen` → `reopenMarket`).
      */
     function closeMarket(uint256 fromHour, uint256 toHour) external onlyOwnerOrGuardian nonReentrant {
@@ -831,7 +880,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         emit MarketClosureAdded(fromHour, toHour);
     }
 
-    /// @notice A reopening WIDENS the service: owner only, 24-hour queue (valid until eta + 7 days). At most 168 hours.
+    /// @notice A reopening WIDENS the service: owner only, 1-hour queue (valid until eta + 7 days). At most 168 hours.
     function queueReopen(uint256 fromHour, uint256 toHour) external onlyOwner nonReentrant {
         if (toHour <= fromHour || toHour - fromHour > MAX_CLOSURE_AHEAD_HOURS) revert BadValue();
         emit MarketReopenQueued(fromHour, toHour, _queue(_rq(fromHour, toHour), bytes32(uint256(1))));
@@ -912,7 +961,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         emit SwapCapLowered(currency0, currency1, cap, capX, msg.sender);
     }
 
-    /// @notice RAISING the buckets (UNLIMITED included) needs the owner and 24 h; each one equal to or above the old value,
+    /// @notice RAISING the buckets (UNLIMITED included) needs the owner and 1 h; each one equal to or above the old value,
     ///         at least one STRICTLY above. On a CL row only (UNLIMITED, UNLIMITED).
     function queueSwapCap(address currency0, address currency1, uint128 cap, uint128 capX)
         external
@@ -1010,9 +1059,124 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
 
     /// @dev A bucket's level after the leak: `used − cap·(now − at)/SWAP_CAP_WINDOW` (>= 0), and the room `cap − used` (>= 0).
     function _level(uint256 cap, uint256 used0, uint64 at) internal view returns (uint256 used, uint256 room) {
-        uint256 leak = FullMath.mulDiv(cap, block.timestamp - at, SWAP_CAP_WINDOW);
+        return _drain(cap, used0, at, SWAP_CAP_WINDOW);
+    }
+
+    function _drain(uint256 cap, uint256 used0, uint64 at, uint256 window)
+        internal
+        view
+        returns (uint256 used, uint256 room)
+    {
+        uint256 leak = FullMath.mulDiv(cap, block.timestamp - at, window);
         used = used0 > leak ? used0 - leak : 0;
         room = cap > used ? cap - used : 0;
+    }
+
+    // ------------------------------------------------------------------ depth room (rows with a v3 source)
+
+    /**
+     * @notice Takes the principal of an OPERATOR swap-flow run from the pair's depth room (bound Steward only; BEFORE the
+     *         Engine call, in the same transaction, so a revert undoes the run). Rows without a depth room (POKE, NONE):
+     *         no-op. With D = min(depth at listing, live source depth) (`METER.liveSourceUsd`): D >= $4,000, no limit;
+     *         below, `valueUsd8` (the one-sided principal in 8-decimal USD at the anchor) must fit the room of a bucket
+     *         of D x DEPTH_ROOM_BPS / 10,000 that drains over DEPTH_ROOM_WINDOW, else
+     *         `DepthRoomExceeded(valueUsd8, room)`. Liquidity added to the source after listing lifts D above the depth
+     *         at listing only once it has held (`refreshDepth`).
+     */
+    function consumeDepthRoom(address currency0, address currency1, uint256 valueUsd8) external {
+        if (msg.sender != steward) revert NotOperator();
+        bytes32 pid = pairId(currency0, currency1);
+        (uint256 cap8, uint256 d) = _roomCap(pid, currency0, currency1);
+        if (cap8 == type(uint256).max) return;
+        DepthRoom storage r = depthRoom[pid];
+        (uint256 used, uint256 room) = _drain(cap8, r.used8, r.at, K.DEPTH_ROOM_WINDOW);
+        if (valueUsd8 > room) revert DepthRoomExceeded(valueUsd8, room);
+        (r.used8, r.at) = (uint128(used + valueUsd8), uint64(block.timestamp));
+        emit DepthRoomUsed(currency0, currency1, valueUsd8, d);
+    }
+
+    /// @notice Preview of `consumeDepthRoom` (Steward `evaluateRun`): the room left now (8-decimal USD);
+    ///         `type(uint256).max` when the pair has no depth limit.
+    function previewDepthRoom(address currency0, address currency1) external view returns (uint256 room8) {
+        bytes32 pid = pairId(currency0, currency1);
+        (uint256 cap8,) = _roomCap(pid, currency0, currency1);
+        if (cap8 == type(uint256).max) return cap8;
+        DepthRoom storage r = depthRoom[pid];
+        (, room8) = _drain(cap8, r.used8, r.at, K.DEPTH_ROOM_WINDOW);
+    }
+
+    /// @notice Depth room state (keeper, site): the depth at listing and the live depth (whole USD; live is
+    ///         `type(uint256).max` for kinds without a room, and exactly $4,000 on a Chainlink-priced source proven to
+    ///         hold at least that), the bucket size, its level and the room (8-decimal USD; size and room are
+    ///         `type(uint256).max` when there is no limit).
+    function depthRoomOf(address currency0, address currency1)
+        external
+        view
+        returns (uint256 listUsd, uint256 liveUsd, uint256 cap8, uint256 used8, uint256 room8)
+    {
+        bytes32 pid = pairId(currency0, currency1);
+        DepthRoom storage r = depthRoom[pid];
+        listUsd = r.listUsd;
+        PairEntry storage e = _entries[pid];
+        liveUsd = e.gate != 0 && _roomKind(e.srcKind) ? METER.liveSourceUsd(currency0, currency1, e, _nc[pid]) : type(uint256).max;
+        (cap8,) = _roomCap(pid, currency0, currency1);
+        if (cap8 == type(uint256).max) return (listUsd, liveUsd, cap8, 0, cap8);
+        (used8, room8) = _drain(cap8, r.used8, r.at, K.DEPTH_ROOM_WINDOW);
+    }
+
+    /// @dev The bucket size (8-decimal USD) and D; `type(uint256).max` when there is no depth limit.
+    function _roomCap(bytes32 pid, address c0, address c1) internal view returns (uint256 cap8, uint256 d) {
+        PairEntry storage e = _entries[pid];
+        if (e.gate == 0 || !_roomKind(e.srcKind)) return (type(uint256).max, type(uint256).max);
+        d = depthRoom[pid].listUsd;
+        uint256 live = METER.liveSourceUsd(c0, c1, e, _nc[pid]);
+        if (live < d) d = live;
+        if (d >= K.FULL_SIZE_DEPTH_USD) return (type(uint256).max, d);
+        cap8 = d * 1e8 * K.DEPTH_ROOM_BPS / 10_000;
+    }
+
+    /**
+     * @notice Open to anyone: one read of a row with a depth room listed below `FULL_SIZE_DEPTH_USD`. A live source depth
+     *         above the depth at listing starts a hold, or lowers the hold's lowest read. A depth at or below the depth
+     *         at listing ends the hold. The first read at least `DEPTH_HOLD` after the start raises the depth at listing
+     *         to the lowest read of the hold, at most `FULL_SIZE_DEPTH_USD`. Nothing else changes: D stays the smaller of
+     *         the depth at listing and the live depth. Returns the depth at listing after the call. `PoolNotAllowed` on a
+     *         row without a depth room; the meter's reverts when the source or a feed cannot be read.
+     */
+    function refreshDepth(address currency0, address currency1) external returns (uint256 listUsd) {
+        bytes32 pid = pairId(currency0, currency1);
+        PairEntry storage e = _entries[pid];
+        if (e.gate == 0 || !_roomKind(e.srcKind)) revert PoolNotAllowed();
+        DepthRoom storage r = depthRoom[pid];
+        listUsd = r.listUsd;
+        if (listUsd >= K.FULL_SIZE_DEPTH_USD) return listUsd;
+        uint256 live = METER.liveSourceUsd(currency0, currency1, e, _nc[pid]);
+        if (live > K.FULL_SIZE_DEPTH_USD) live = K.FULL_SIZE_DEPTH_USD;
+        DepthHold storage h = depthHold[pid];
+        if (live <= listUsd) {
+            if (h.since != 0) {
+                delete depthHold[pid];
+                emit DepthHoldSet(currency0, currency1, 0, 0);
+            }
+            return listUsd;
+        }
+        if (h.since == 0) {
+            depthHold[pid] = DepthHold(uint64(live), uint64(block.timestamp));
+            emit DepthHoldSet(currency0, currency1, live, uint64(block.timestamp));
+            return listUsd;
+        }
+        uint256 low = h.lowUsd < live ? h.lowUsd : live;
+        if (block.timestamp - h.since < DEPTH_HOLD) {
+            if (low != h.lowUsd) {
+                h.lowUsd = uint64(low);
+                emit DepthHoldSet(currency0, currency1, low, h.since);
+            }
+            return listUsd;
+        }
+        delete depthHold[pid];
+        r.listUsd = uint64(low);
+        emit DepthRaised(currency0, currency1, listUsd, low);
+        return low;
     }
 
     // ------------------------------------------------------------------ slow reference (SR; NC rows only)
@@ -1070,7 +1234,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         emit SlowRateLowered(currency0, currency1, rate, msg.sender);
     }
 
-    /// @notice RAISING the SR rate needs the owner and 24 h (<= `SR_RATE_MAX`). Does not touch the version (the rate is not semantic).
+    /// @notice RAISING the SR rate needs the owner and 1 h (<= `SR_RATE_MAX`). Does not touch the version (the rate is not semantic).
     function queueSlowRate(address currency0, address currency1, uint16 rate) external onlyOwner nonReentrant {
         bytes32 pid = pairId(currency0, currency1);
         _checkRateRaise(pid, rate);
@@ -1181,8 +1345,9 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
 
     /**
      * @dev SR target. Returns the reported source tick (`NcSlowPoked.twap`), the target and whether a step is allowed.
-     *      POKE: target = clamp(SR, medLo, medHi). Unregistered pokes can only WIDEN bucket lo/hi (medLo only down, medHi
-     *      only up), so this target never pulls the SR away from the true price range (at most it stops it).
+     *      POKE: target = clamp(SR, medLo, medHi), from registered pokes only (`consult`). Extra registered reads can
+     *      only WIDEN bucket lo/hi (medLo only down, medHi only up), so this target never pulls the SR away from the
+     *      true price range (at most it stops it); other callers' pokes do not reach these values at all.
      *      V3 kinds: target = TWAP900, but a step only while TWAP60, TWAP10 and spot are within G of TWAP900 (the same
      *      checks as `vetoOf`), so short spikes do not advance the SR.
      */
@@ -1216,7 +1381,7 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
 
     /// @dev SR gate: [lo, hi] ⊆ [SR − G, SR + G] (SR: now, moving toward `target`; while frozen, the stored value), else
     ///      `VetoSlowFar(src, SR)`. V3 kinds: lo = hi = TWAP900 (the caller has already checked calm). POKE: lo = medLo,
-    ///      hi = medHi (unregistered pokes can only widen them, which can only close the gate).
+    ///      hi = medHi (registered-only; extra registered reads can only widen them, which can only close the gate).
     function _slowGate(
         bytes32 pid,
         address currency0,
@@ -1233,9 +1398,11 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
 
     // ------------------------------------------------------------------ writes
 
-    function _storeCl(address c0, address c1, PairConfig calldata cfg, PairEntry memory e) internal {
+    function _storeCl(address c0, address c1, PairConfig calldata cfg, PairEntry memory e, uint256 srcUsd) internal {
         NcSource memory none;
-        emit PairAdded(c0, c1, cfg, _commit(c0, c1, e, none, cfg.source.pokePool, cfg.pools, CAP_UNLIMITED, CAP_UNLIMITED));
+        emit PairAdded(
+            c0, c1, cfg, _commit(c0, c1, e, none, cfg.source.pokePool, cfg.pools, CAP_UNLIMITED, CAP_UNLIMITED, srcUsd)
+        );
     }
 
     /**
@@ -1245,15 +1412,20 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
      *      trail and `at`, so an administrative write never resets the trail. A rewrite NEVER raises the rate (a lower
      *      value is taken; a raise goes through `queueSlowRate`).
      */
-    function _storeNc(address c0, address c1, NcPairConfig calldata cfg, PairEntry memory e, NcSource memory n)
-        internal
-    {
+    function _storeNc(
+        address c0,
+        address c1,
+        NcPairConfig calldata cfg,
+        PairEntry memory e,
+        NcSource memory n,
+        uint256 srcUsd
+    ) internal {
         bytes32 pid = pairId(c0, c1);
         NcSlow storage sr = ncSlow[pid];
         PairEntry storage old = _entries[pid];
         bool sameTrack = sr.rate != 0 && old.srcKind == e.srcKind && old.vetoPool == e.vetoPool
             && old.vetoFlip == e.vetoFlip && pokePoolOf[pid] == cfg.pokePool;
-        uint32 ep = _commit(c0, c1, e, n, cfg.pokePool, cfg.pools, cfg.capHard, cfg.capX);
+        uint32 ep = _commit(c0, c1, e, n, cfg.pokePool, cfg.pools, cfg.capHard, cfg.capX, srcUsd);
         if (!sameTrack) {
             // A new track on a listed pair never raises the current rate (a guardian reduction made while the source
             // change waited in the queue survives); a raise goes through `queueSlowRate`.
@@ -1267,11 +1439,14 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     }
 
     /**
-     * @dev If a listed pair is rewritten with the SAME semantic hash, the version is KEPT (a fill refresh or added /
-     *      removed pools do not stop swap configs); a different hash, or re-adding after `removePair`, bumps it. The new
-     *      pool set is listed under the current version; pools that drop out of the set lose their record (`PoolRemoved`).
-     *      Budget (two buckets): initial values on a new listing; on a listed pair a rewrite NEVER raises the budget
-     *      (only `queueSwapCap` does).
+     * @dev Version: a listed pair rewritten with the SAME semantic hash, or with the same price source and no looser
+     *      limit (`GoatVersionRule.keepsVersion`), KEEPS its version (a fill refresh, added / removed pools or a
+     *      tightening do not stop swap configs); any other change bumps it. A pair re-added after `removePair` keeps
+     *      its version only with exactly the semantic hash it had. The new pool set is listed under the current
+     *      version; pools that drop out of the set lose their record (`PoolRemoved`). Budget (two buckets): initial
+     *      values on a new listing; on a listed pair a rewrite NEVER raises the budget (only `queueSwapCap` does).
+     *      Depth room: `srcUsd` (the meter's measure at this listing) becomes the depth at listing; the bucket's level
+     *      is kept and a running hold ends.
      */
     function _commit(
         address c0,
@@ -1281,7 +1456,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         bytes32 pokePool,
         PoolSpec[] calldata pools,
         uint128 initialCap,
-        uint128 initialCapX
+        uint128 initialCapX,
+        uint256 srcUsd
     ) internal returns (uint32 ep) {
         bytes32 pid = pairId(c0, c1);
         // Semantic hash: the entry to store (epoch 0; feed rules, flags, gate, K, source, kind) + the NC source + the poke
@@ -1289,10 +1465,14 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         bytes32 h = keccak256(abi.encode(e, n, pokePool));
         bool listed = _entries[pid].gate != 0;
         ep = pairEpoch[pid];
-        if (!listed || semHash[pid] != h) {
+        bool keep = semHash[pid] == h && ep != 0;
+        if (listed && !keep) keep = GoatVersionRule.keepsVersion(_entries[pid], _nc[pid], pokePoolOf[pid], e, n, pokePool);
+        if (!keep) {
             ep += 1;
             pairEpoch[pid] = ep;
         }
+        depthRoom[pid].listUsd = srcUsd > type(uint64).max ? type(uint64).max : uint64(srcUsd);
+        delete depthHold[pid];
         e.epoch = ep;
         _entries[pid] = e;
         _nc[pid] = n;
@@ -1353,7 +1533,8 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
     /**
      * @notice The Steward's scope read: the pool must be allowed at the pair's CURRENT version, else `PoolNotAllowed`.
      *         Returns the gate G, the entry version, whether swap flows are open (a source exists AND neither bucket is
-     *         0) and whether the pair is budgeted (either bucket is not UNLIMITED).
+     *         0) and whether the pair is budgeted (either bucket is not UNLIMITED, or the row has a v3 source and so a
+     *         depth room): a budgeted pair's operator swap flows call `consumeSwapBudget` and `consumeDepthRoom`.
      */
     function poolInfo(address currency0, address currency1, bytes32 poolId)
         public
@@ -1367,7 +1548,10 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
         SwapBudget storage b = swapBudget[pid];
         (uint128 cap, uint128 capX) = (b.cap, b.capX);
         return (
-            e.gate, e.epoch, e.srcKind != K.SRC_NONE && cap != 0 && capX != 0, cap != CAP_UNLIMITED || capX != CAP_UNLIMITED
+            e.gate,
+            e.epoch,
+            e.srcKind != K.SRC_NONE && cap != 0 && capX != 0,
+            cap != CAP_UNLIMITED || capX != CAP_UNLIMITED || _roomKind(e.srcKind)
         );
     }
 
@@ -1520,9 +1704,9 @@ contract GoatV4PairRegistry is Ownable2Step, ReentrancyGuard {
      *     c0 -> Q -> c1 (one observe([900, 60, 10, 0]) per leg, cumulatives summed before the floor; spot = the sum of
      *     the two hop floors); either leg unreadable or a mean beyond the extreme-price bound → `AnchorVetoed`; no
      *     one-leg fallback.
-     *   - CL+POKE: full window; medLo < A − K or medHi > A + K → `AnchorVetoed` (statistics that extra pokes can only
-     *     widen; medMid is not used for K because it can move both ways); the newest buckets' lo/hi outside A ± G →
-     *     `VetoTwapFar`.
+     *   - CL+POKE: full window; medLo < A − K or medHi > A + K → `AnchorVetoed` (statistics that extra registered
+     *     reads can only widen; medMid is not used for K because it can move both ways); the newest buckets' lo/hi
+     *     outside A ± G → `VetoTwapFar`. Every POKE value here is from registered pokes only (`consult`).
      *   - NC V3SAME / V3DERIVED: the source's TWAP60 / TWAP10 and spot within G of the source's TWAP900 (the feed term
      *     cancels out in the differences); SR: TWAP900 within G of the slow reference (`VetoSlowFar`).
      *   - NC POKE: the newest buckets' lo/hi within medMid ± G; SR: [medLo, medHi] within the slow reference ± G.

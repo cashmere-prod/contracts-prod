@@ -36,7 +36,7 @@ struct PairRow {
 // pool: the burst is the configured cap and it refills over SWAP_CAP_WINDOW. The budget is counted in the pair's "hard"
 // leg (the token with a Chainlink price).
 struct NcCfg {
-    address refPool; // pinned v3 reference pool of THIS pair (cardinality >= 1,800, depth >= MIN_VETO_DEPTH_USD)
+    address refPool; // pinned v3 reference pool of THIS pair (cardinality >= 1,800, depth >= MIN_NC_DEPTH_USD)
     uint16 gate; // G for execution tiers with fee <= 0.3% (ticks)
     uint16 gateHighFee; // G for the 1% tier (0 = not covered)
     bool capIn0; // budget unit: true = raw token0, false = raw token1; must be the hard leg (Chainlink price)

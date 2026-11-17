@@ -639,7 +639,7 @@ contract GoatSelfCompoundor is Ownable, ReentrancyGuard {
      * TWAP is not usable; the real remedy is to grow that pool's observation buffer
      * (`increaseObservationCardinalityNext`, callable by anyone).
      * The outside price (step 2) comes only from Chainlink or from a pool the anchor owner assigned
-     * with a 24 hour delay (`GoatPriceAnchor`); the factory is not scanned.
+     * with a 1 hour delay (`GoatPriceAnchor`); the factory is not scanned.
      * The no-check path is also used when a source exists but is not usable at the moment.
      */
     /// @return src price source used (SRC_*)

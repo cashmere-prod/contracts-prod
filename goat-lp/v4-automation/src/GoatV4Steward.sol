@@ -46,14 +46,18 @@ contract GoatV4Steward is GoatV4StewardCore {
 
     // ------------------------------------------------------------------ config bounds
 
-    /// @dev T >= G + 1 (G per pair from the registry, at least 100): every spot inside the gate is then outside the old
-    ///      range on the same side (one-sided burn). Checked at config time only: G is part of the registry's semantic
-    ///      hash, so a later change of G bumps the pair epoch and every swap flow reverts `PairChanged` in `_swapPre`
-    ///      until the owner sets the config again (the same holds for the G + 1 bound of the EXIT swap side).
+    /// @dev T >= G + 1 (G per pair from the registry, from GATE_MIN 50 to GATE_MAX 140): every spot inside the gate is
+    ///      then outside the old range on the same side (one-sided burn). Checked at config time only. A larger G bumps
+    ///      the pair epoch (`GoatVersionRule`) and every swap flow reverts `PairChanged` in `_swapPre` until the owner
+    ///      sets the config again (the same holds for the G + 1 bound of the EXIT swap side); a smaller G keeps the
+    ///      epoch, and a saved T, already above the old G, stays above the new one.
     uint16 internal constant MAX_TRIGGER_TICKS = 20_000;
     uint32 internal constant MIN_INTERVAL_FLOOR = 3600;
     uint32 internal constant MAX_INTERVAL = 30 days;
     uint8 internal constant MAX_BUDGET = 20;
+    /// @dev Auto-range budget value that means "no move limit": never counted down. Accepted budgets: 1 to MAX_BUDGET
+    ///      (counted down by one per move) or NO_MOVE_LIMIT.
+    uint8 internal constant NO_MOVE_LIMIT = 255;
 
     /// @notice EXIT flags.
     uint8 internal constant LOWER_ON = 1;
@@ -74,7 +78,7 @@ contract GoatV4Steward is GoatV4StewardCore {
         uint16 triggerTicks; // RECENTER: T
         uint16 slippageBps; // both modes: s
         uint32 minInterval; // RECENTER
-        uint8 budget; // RECENTER: runs left
+        uint8 budget; // RECENTER: runs left (255 = no move limit, never counted down)
         uint40 lastRunAt; // RECENTER
         uint8 flags; // EXIT
         int24 lowerTrigger; // EXIT: absolute tick
@@ -87,8 +91,8 @@ contract GoatV4Steward is GoatV4StewardCore {
         uint16 triggerTicks;
         uint16 slippageBps;
         uint32 minInterval;
-        uint8 budget;
-        bool standing; // lineage continues through the ForAll approval
+        uint8 budget; // 1 to 20, or 255 = no move limit
+        bool standing; // must be true: the lineage continues through the ForAll approval
         uint24 maxSwapFeePips; // [1, MAX_USER_SWAP_FEE] (the owner-signed cap on the total fee)
     }
 
@@ -110,6 +114,7 @@ contract GoatV4Steward is GoatV4StewardCore {
         uint24 fee;
         int24 ts;
         address hooks;
+        uint128 take; // a piece of a swap flow: the liquidity to take (0 = the whole position)
     }
 
     /// @notice The owner's POSM permit signature (not an economic parameter).
@@ -178,6 +183,18 @@ contract GoatV4Steward is GoatV4StewardCore {
         bool bySelf;
     }
 
+    /// @notice `statusOf`: one read per position for the site and the keeper.
+    struct Status {
+        uint8 mode; // 0 no config, 1 RECENTER, 2 EXIT
+        bool ready; // an operator run would pass now (`previewTrigger`)
+        bytes4 reason; // the error a run would give now (0 when ready)
+        uint40 nextRunAt; // RECENTER: lastRunAt + minInterval (the earliest next move); 0 otherwise
+        uint8 movesLeft; // RECENTER: moves left (255 = no move limit); 0 otherwise
+        bool permissionOk; // the Engine may act: the per-position approval, or STANDING plus the all-positions permission
+        bool versionOk; // a swap config's pair version is the current one (always true for a withdraw-only EXIT)
+        bool swapsOpen; // the position's pool is listed and its pair is open to swap flows
+    }
+
     /// @dev Pre-run evaluation (pure read; runs and `evaluateRun` use the same function).
     struct Eval {
         address owner;
@@ -203,14 +220,20 @@ contract GoatV4Steward is GoatV4StewardCore {
     mapping(uint256 => Config) internal _configs;
     /// @notice The owner who wrote the config. A run requires `ownerOf == configOwner` (it stops if the NFT changes hands).
     mapping(uint256 => address) public configOwner;
+    /// @notice A RECENTER in pieces: the position the earlier pieces of a position's move went to (0 = none). Written by
+    ///         a piece that leaves liquidity behind; deleted by the run that empties (burns) the position and by every
+    ///         config write on it (`setRangeConfig`, `setExitConfig`, `clearConfig` and their batches).
+    mapping(uint256 => uint256) public pieceDest;
 
     // ------------------------------------------------------------------ events
 
     event RangeConfigSet(uint256 indexed tokenId, address indexed owner, RangeParams p);
     event ExitConfigSet(uint256 indexed tokenId, address indexed owner, ExitParams p);
     event ConfigCleared(uint256 indexed tokenId, address indexed by);
-    /// @dev Emitted after every RECENTER run: the burned and minted token ids, the owner and the full report.
+    /// @dev Emitted after a RECENTER run that burns the old id and mints the new one: the burned and minted token ids,
+    ///      the owner and the full report. Every other RECENTER run is a piece (`RerangePiece`).
     event Reranged(uint256 indexed burnedTokenId, uint256 indexed mintedTokenId, address indexed owner, RerangeReport r);
+    /// @dev Emitted after an EXIT run that burns the position (a whole exit, or the piece that empties it).
     event PositionExited(uint256 indexed tokenId, address indexed owner, ExitReport r);
     /// @notice Emitted after every run with `swapIn > 0` (the report structs are unchanged). `execPoolId` = the pool the
     ///         swap ran on; `feePips` = the exec rule's φ (the floor term actually applied is
@@ -219,6 +242,23 @@ contract GoatV4Steward is GoatV4StewardCore {
     ///         total (pf ⊕ lp + tax) the Engine checked (the sizer uses only its input-side part); `feeSigned` = a keeper
     ///         signature applied (`runSwap`, any exec kind). Topic 0x0d5b7977….
     event SwapLeg(uint256 indexed tokenId, bytes32 indexed execPoolId, uint24 feePips, uint24 totalFeePips, bool feeSigned);
+    /// @notice A RECENTER piece: the old id, the id it went to, the owner, the same report as `Reranged` (principal,
+    ///         value and fees of the piece; `oldLiquidity` the old id's before it), the liquidity left in the old id (0 =
+    ///         this piece burned it), whether it minted `newTokenId`, and whether it opened the move (the old id had no
+    ///         link before it). `Reranged` keeps its meaning: one tx burned the old id and minted the new one.
+    event RerangePiece(
+        uint256 indexed tokenId,
+        uint256 indexed newTokenId,
+        address indexed owner,
+        RerangeReport r,
+        uint128 liquidityLeft,
+        bool minted,
+        bool opened
+    );
+    /// @notice A swap-exit piece that leaves liquidity in the position (the id is not burned; its config stays), with the
+    ///         same report as `PositionExited` (`liquidity` the position's before it). The piece that empties the position
+    ///         burns it and emits `PositionExited`, as a whole exit does.
+    event ExitPiece(uint256 indexed tokenId, address indexed owner, ExitReport r, uint128 liquidityLeft);
 
     /// @notice The executor and the only holder of the NFT approval. Created in this constructor; it cannot be changed.
     GoatV4StewardEngine public immutable ENGINE;
@@ -278,14 +318,41 @@ contract GoatV4Steward is GoatV4StewardCore {
 
     /// @notice RECENTER config. Executes nothing. Only on a pair with a source and open swaps.
     ///         An exit-only kind-2 own pool (add-liquidity hook bits 0x0C00) never mints: `BadConfig()`.
+    ///         Auto-range always keeps running after a move: `standing` must be set (`StandingRequired`) and the owner
+    ///         must already have given the Engine the all-positions permission (`AllPositionsApprovalRequired`), since
+    ///         every move mints a new position id. `budget`: 1 to 20 moves, or 255 = no move limit.
     function setRangeConfig(uint256 tokenId, RangeParams calldata p) external nonReentrant {
+        _setRangeConfig(tokenId, p);
+    }
+
+    /// @notice Change during a move: the same rule written on every listed id with a config in one transaction, each
+    ///         through every check of `setRangeConfig`; any such id that fails reverts the whole batch. An id with no
+    ///         config (burned by the last piece, already cleared) is skipped, so a list read a moment earlier never fails
+    ///         and a burned id is never written.
+    function setRangeConfigs(uint256[] calldata tokenIds, RangeParams calldata p) external nonReentrant {
+        for (uint256 i; i < tokenIds.length; ++i) {
+            if (_configs[tokenIds[i]].mode != 0) _setRangeConfig(tokenIds[i], p);
+        }
+    }
+
+    /// @notice Stop during a move: `clearConfig` on every listed id in one transaction. An id with no config (burned by
+    ///         the last piece, already cleared) is skipped, so a list read a moment earlier never fails.
+    function clearConfigs(uint256[] calldata tokenIds) external nonReentrant {
+        for (uint256 i; i < tokenIds.length; ++i) {
+            if (_configs[tokenIds[i]].mode != 0) _clearConfig(tokenIds[i]);
+        }
+    }
+
+    function _setRangeConfig(uint256 tokenId, RangeParams calldata p) internal {
         (address owner,,, PoolRule memory rule) = _configPreflight(tokenId, MODE_RECENTER, p.slippageBps, true);
         if (
             int24(uint24(p.triggerTicks)) <= rule.gate || p.triggerTicks > MAX_TRIGGER_TICKS
                 || p.minInterval < MIN_INTERVAL_FLOOR || p.minInterval > MAX_INTERVAL || p.budget == 0
-                || p.budget > MAX_BUDGET || p.maxSwapFeePips == 0 || p.maxSwapFeePips > MAX_USER_SWAP_FEE
-                || p.maxSwapFeePips < rule.floorFeePips || rule.exitOnly
+                || (p.budget > MAX_BUDGET && p.budget != NO_MOVE_LIMIT) || p.maxSwapFeePips == 0
+                || p.maxSwapFeePips > MAX_USER_SWAP_FEE || p.maxSwapFeePips < rule.floorFeePips || rule.exitOnly
         ) revert BadConfig();
+        if (!p.standing) revert StandingRequired();
+        if (!IGoatPosmNft(address(POSM)).isApprovedForAll(owner, address(ENGINE))) revert AllPositionsApprovalRequired();
 
         uint40 last = _configs[tokenId].lastRunAt;
         _configs[tokenId] = Config({
@@ -302,6 +369,7 @@ contract GoatV4Steward is GoatV4StewardCore {
             maxSwapFeePips: p.maxSwapFeePips
         });
         configOwner[tokenId] = owner;
+        delete pieceDest[tokenId]; // a config write ends the link
         emit RangeConfigSet(tokenId, owner, p);
     }
 
@@ -349,12 +417,17 @@ contract GoatV4Steward is GoatV4StewardCore {
             maxSwapFeePips: swapFlow ? p.maxSwapFeePips : 0
         });
         configOwner[tokenId] = owner;
+        delete pieceDest[tokenId]; // a config write ends the link
         emit ExitConfigSet(tokenId, owner, p);
     }
 
     /// @notice Deletes the config. The owner or the config's writer (the previous owner if the NFT changed hands) can
     ///         call it. Not affected by pause or retirement: turning automation off always works. `lastRunAt` is kept.
     function clearConfig(uint256 tokenId) external nonReentrant {
+        _clearConfig(tokenId);
+    }
+
+    function _clearConfig(uint256 tokenId) internal {
         if (msg.sender != configOwner[tokenId]) {
             address cur;
             try IGoatPosmNft(address(POSM)).ownerOf(tokenId) returns (address o) {
@@ -366,6 +439,7 @@ contract GoatV4Steward is GoatV4StewardCore {
         delete _configs[tokenId];
         _configs[tokenId].lastRunAt = last;
         delete configOwner[tokenId];
+        delete pieceDest[tokenId]; // a config write ends the link
         emit ConfigCleared(tokenId, msg.sender);
     }
 
@@ -396,7 +470,29 @@ contract GoatV4Steward is GoatV4StewardCore {
         uint24 signedOfz
     ) external nonReentrant {
         (Config memory cfg, address owner, bool bySelf) = _preflight(tokenId, deadline);
-        _perform(tokenId, cfg, owner, bySelf, Leg(true, signedZfo, signedOfz, execFee, execTickSpacing, execHooks));
+        _perform(tokenId, cfg, owner, bySelf, Leg(true, signedZfo, signedOfz, execFee, execTickSpacing, execHooks, 0));
+    }
+
+    /// @notice `runSwap` for a piece of a swap flow: takes `liquidity` of the position (all of it at or above its
+    ///         liquidity) through every check of a run, and charges every budget and the room with the piece. The
+    ///         position keeps its config until it is empty. A RECENTER piece is added to the position the earlier
+    ///         pieces went to while that one holds (`_destHolds`), else it mints a new one. A piece of a withdraw-only
+    ///         EXIT is `BadConfig`; a RECENTER piece needs the all-positions permission (`NotApprovedForRun`).
+    function runSwapPiece(
+        uint256 tokenId,
+        uint256 deadline,
+        uint128 liquidity,
+        uint24 execFee,
+        int24 execTickSpacing,
+        address execHooks,
+        uint24 signedZfo,
+        uint24 signedOfz
+    ) external nonReentrant {
+        if (liquidity == 0) revert EmptyPosition();
+        (Config memory cfg, address owner, bool bySelf) = _preflight(tokenId, deadline);
+        _perform(
+            tokenId, cfg, owner, bySelf, Leg(true, signedZfo, signedOfz, execFee, execTickSpacing, execHooks, liquidity)
+        );
     }
 
     /// @notice `run` plus the owner's POSM permit signature. A failing permit is ignored; the real condition is `getApproved`.
@@ -446,8 +542,9 @@ contract GoatV4Steward is GoatV4StewardCore {
      *
      *      The anchor trigger reads the median that DELAYS it: the upper side (EXIT `upperTrigger`, RECENTER
      *      `tickUpper + T`) needs `tickLo` >= the level, the lower side (EXIT `lowerTrigger`, RECENTER `tickLower - T`)
-     *      needs `tickHi` <= the level. On NC+POKE these are medLo / medHi, which unregistered pokes can only push
-     *      outward, so they can only delay a trigger. On other kinds `tickLo == tickHi == tick` (`anchorOf`) and the
+     *      needs `tickHi` <= the level. On NC+POKE these are medLo / medHi of the registered pokes, which extra
+     *      registered reads can only push outward (other callers' pokes cannot move them), so they can only delay a
+     *      trigger. On other kinds `tickLo == tickHi == tick` (`anchorOf`) and the
      *      behaviour is the same. The trigger and the floor use the same median of the same side.
      */
     function _evaluate(uint256 tokenId, Config memory cfg, address owner) internal view returns (Eval memory e) {
@@ -554,17 +651,32 @@ contract GoatV4Steward is GoatV4StewardCore {
     /// @dev Body of a run.
     function _perform(uint256 tokenId, Config memory cfg, address owner, bool bySelf, Leg memory leg) internal {
         Eval memory e = _evaluate(tokenId, cfg, owner);
+        // A piece (swap flows only): its principal and value replace the position's, so the buckets, the pair budgets
+        // and the depth room below are charged with the piece. A RECENTER piece may add to another id of the owner (the
+        // link), so it needs the all-positions permission; an exit piece touches this id only and runs on the run's own
+        // authorization (`_evaluate`: the one-position approval, or STANDING plus ForAll).
+        uint128 take = leg.take == 0 || leg.take >= e.liquidity ? e.liquidity : leg.take;
+        if (take != e.liquidity) {
+            if (cfg.mode != MODE_RECENTER && !e.swapExit) revert BadConfig();
+            if (cfg.mode == MODE_RECENTER && !IGoatPosmNft(address(POSM)).isApprovedForAll(owner, address(ENGINE))) {
+                revert NotApprovedForRun();
+            }
+            (e.p0, e.p1) = GoatRecenterMath.oneSidedPrincipal(e.upperSide, e.tickLower, e.tickUpper, take);
+            e.valueUsd8 = _usd8(e.p0, e.p1, e.anchor);
+        }
         // The owner's own run is not counted in the bucket; an operator run is.
         (bool counted, uint256 kind) = _bucketOf(cfg, e);
         if (counted && !bySelf) {
             _buckets[kind].consume(e.valueUsd8);
             // On a budgeted pair the one-sided PRINCIPAL of an OPERATOR run (swap-less RECENTER included) is taken from
-            // the pair's buckets BEFORE the Engine call (hard and X legs in their own units). The owner's own run is not
-            // counted. Without room the whole run reverts.
+            // the pair's buckets BEFORE the Engine call (hard and X legs in their own units), and its USD value from the
+            // depth room of a row with a v3 source. The owner's own run is not counted. Without room the whole run
+            // reverts.
             if (e.rule.budgeted) {
-                REGISTRY.consumeSwapBudget(
-                    Currency.unwrap(e.key.currency0), Currency.unwrap(e.key.currency1), e.p0, e.p1
-                );
+                address c0 = Currency.unwrap(e.key.currency0);
+                address c1 = Currency.unwrap(e.key.currency1);
+                REGISTRY.consumeSwapBudget(c0, c1, e.p0, e.p1);
+                REGISTRY.consumeDepthRoom(c0, c1, e.valueUsd8);
             }
         }
 
@@ -576,6 +688,7 @@ contract GoatV4Steward is GoatV4StewardCore {
         plan.swapExit = e.swapExit;
         plan.p0 = e.p0;
         plan.p1 = e.p1;
+        if (take != e.liquidity) plan.take = take;
         plan.anchorTick = e.anchor.tick;
         plan.anchorSqrtPriceX96 = e.anchor.sqrtPriceX96;
         plan.gate = e.rule.gate;
@@ -652,41 +765,102 @@ contract GoatV4Steward is GoatV4StewardCore {
             if (plan.newLower == e.tickLower && plan.newUpper == e.tickUpper) revert RangeUnchanged();
             plan.recenter = true;
             plan.feeBps = feeBps[0];
-            // State is written BEFORE external calls. The config moves to the new id after the mint.
+            // A piece goes to the link of the earlier pieces while it holds (`_destHolds`): the sizer and the add then
+            // use the link's range. Else a new position centred on the anchor is minted. `opened`: no link before.
+            bool opened = pieceDest[tokenId] == 0;
+            if (!opened) {
+                (bool holds, int24 dLo, int24 dHi) = _destHolds(pieceDest[tokenId], cfg, e);
+                if (holds) (plan.dest, plan.newLower, plan.newUpper) = (pieceDest[tokenId], dLo, dHi);
+            }
+            // State is written BEFORE external calls. The config moves to the new id after the mint (a new id only;
+            // `cfg` is a memory copy, so a piece leaves the old id's stored config as it is).
             cfg.lastRunAt = uint40(block.timestamp);
-            cfg.budget -= 1;
-            delete _configs[tokenId];
-            delete configOwner[tokenId];
+            if (cfg.budget != NO_MOVE_LIMIT) cfg.budget -= 1;
+            if (plan.take == 0) {
+                delete _configs[tokenId];
+                delete configOwner[tokenId];
+                delete pieceDest[tokenId];
+            }
 
             GoatV4StewardEngine.Result memory res = ENGINE.carryOut(plan);
 
             // Structural closing check: owner code ran during the payouts; the new NFT must still be with the owner.
             if (IGoatPosmNft(address(POSM)).ownerOf(res.newTokenId) != e.owner) revert NftLeftMidFlight();
-            // Config migration.
-            _configs[res.newTokenId] = cfg;
-            configOwner[res.newTokenId] = e.owner;
-            _emitReranged(tokenId, e, plan, res, bySelf);
+            // Config migration (a new id only; the link of the earlier pieces keeps its own, never rewritten).
+            if (plan.dest == 0) {
+                _configs[res.newTokenId] = cfg;
+                configOwner[res.newTokenId] = e.owner;
+            }
+            if (plan.take != 0) pieceDest[tokenId] = res.newTokenId;
+            // `Reranged` only for a run that burned the old id and minted the new one; every other run is a piece.
+            RerangeReport memory r = _rerangeReport(e, plan, res, bySelf);
+            if (plan.take == 0 && plan.dest == 0) {
+                emit Reranged(tokenId, res.newTokenId, e.owner, r);
+            } else {
+                emit RerangePiece(tokenId, res.newTokenId, e.owner, r, e.liquidity - take, plan.dest == 0, opened);
+            }
             if (res.swapIn > 0) emit SwapLeg(tokenId, xid, plan.sizeFeePips, res.totalFeePips, plan.feeSigned);
         } else {
             plan.feeBps = feeBps[1];
-            // Single shot: the config is deleted BEFORE external calls.
-            delete _configs[tokenId];
-            delete configOwner[tokenId];
+            // Single shot: the config is deleted BEFORE external calls (a piece keeps it on the rest).
+            if (plan.take == 0) {
+                delete _configs[tokenId];
+                delete configOwner[tokenId];
+            }
 
             GoatV4StewardEngine.Result memory res = ENGINE.carryOut(plan);
-            _emitExited(tokenId, e, res, bySelf);
+            // `PositionExited` only for the run that burned the position; a piece that leaves liquidity is `ExitPiece`.
+            ExitReport memory r = _exitReport(e, res, bySelf);
+            if (plan.take == 0) emit PositionExited(tokenId, e.owner, r);
+            else emit ExitPiece(tokenId, e.owner, r, e.liquidity - take);
             if (res.swapIn > 0) emit SwapLeg(tokenId, xid, plan.sizeFeePips, res.totalFeePips, plan.feeSigned);
         }
     }
 
-    function _emitReranged(
-        uint256 tokenId,
+    /// @dev The link `d` may take this piece (it holds) when all of these are true: its config was written by the owner
+    ///      with the very same rule as the old id (every `Config` field but `lastRunAt` and `budget`, which a move
+    ///      sets), so a rule the owner rewrote on it never takes a piece; it is still the owner's (a burned id reads as
+    ///      not); the Engine is allowed on all of the owner's positions (POSM's add needs it); no subscriber; the same
+    ///      pool; the old position's width; and the gate band strictly inside it: lower + G < anchor.tickLo and
+    ///      upper - G > anchor.tickHi. Strict, because the sizer needs its price limit (anchor -+ G) strictly inside the
+    ///      range: at upper - G == anchor the limit reaches the top and no swap is sized, so the add would revert
+    ///      `ZeroLiquidityMint`. Every centred range meets the strict band (width >= 2 * (G + ts)). Returns the link's
+    ///      ticks.
+    function _destHolds(uint256 d, Config memory cfg, Eval memory e)
+        internal
+        view
+        returns (bool holds, int24 lo, int24 hi)
+    {
+        if (configOwner[d] != e.owner) return (false, 0, 0);
+        Config memory dc = _configs[d];
+        if (
+            dc.mode != cfg.mode || dc.triggerTicks != cfg.triggerTicks || dc.slippageBps != cfg.slippageBps
+                || dc.minInterval != cfg.minInterval || dc.flags != cfg.flags || dc.lowerTrigger != cfg.lowerTrigger
+                || dc.upperTrigger != cfg.upperTrigger || dc.pairEpoch != cfg.pairEpoch
+                || dc.maxSwapFeePips != cfg.maxSwapFeePips
+        ) return (false, 0, 0);
+        if (!IGoatPosmNft(address(POSM)).isApprovedForAll(e.owner, address(ENGINE))) return (false, 0, 0);
+        try IGoatPosmNft(address(POSM)).ownerOf(d) returns (address o) {
+            if (o != e.owner) return (false, 0, 0);
+        } catch {
+            return (false, 0, 0);
+        }
+        (PoolKey memory k, PositionInfo info) = POSM.getPoolAndPositionInfo(d);
+        if (PoolId.unwrap(k.toId()) != e.poolId || info.hasSubscriber()) return (false, 0, 0);
+        lo = info.tickLower();
+        hi = info.tickUpper();
+        if (hi - lo != e.tickUpper - e.tickLower) return (false, 0, 0);
+        int256 g = e.rule.gate;
+        holds = int256(lo) + g < int256(e.anchor.tickLo) && int256(hi) - g > int256(e.anchor.tickHi);
+    }
+
+    /// @dev The report of a RECENTER run or piece (`Reranged`, `RerangePiece`).
+    function _rerangeReport(
         Eval memory e,
         GoatV4StewardEngine.Plan memory plan,
         GoatV4StewardEngine.Result memory res,
         bool bySelf
-    ) internal {
-        RerangeReport memory r;
+    ) internal pure returns (RerangeReport memory r) {
         r.poolId = e.poolId;
         r.oldLower = e.tickLower;
         r.oldUpper = e.tickUpper;
@@ -716,13 +890,14 @@ contract GoatV4Steward is GoatV4StewardCore {
         r.valueUsd8 = e.valueUsd8;
         r.bySelf = bySelf;
         r.vetoApplied = e.vetoApplied;
-        emit Reranged(tokenId, res.newTokenId, e.owner, r);
     }
 
-    function _emitExited(uint256 tokenId, Eval memory e, GoatV4StewardEngine.Result memory res, bool bySelf)
+    /// @dev The report of an EXIT run or piece (`PositionExited`, `ExitPiece`).
+    function _exitReport(Eval memory e, GoatV4StewardEngine.Result memory res, bool bySelf)
         internal
+        pure
+        returns (ExitReport memory r)
     {
-        ExitReport memory r;
         r.poolId = e.poolId;
         r.tickLower = e.tickLower;
         r.tickUpper = e.tickUpper;
@@ -747,7 +922,6 @@ contract GoatV4Steward is GoatV4StewardCore {
         r.paid1 = res.paid1;
         r.valueUsd8 = e.valueUsd8;
         r.bySelf = bySelf;
-        emit PositionExited(tokenId, e.owner, r);
     }
 
     // ================================================================== VIEWS
@@ -773,11 +947,42 @@ contract GoatV4Steward is GoatV4StewardCore {
         // Budget preview: the one-sided principal the run would count (two legs, in their own units) against the room in
         // the pair's buckets; the same value as `run`.
         if (counted && e.rule.budgeted) {
-            (uint256 v, uint256 room) = REGISTRY.previewSwapBudget(
-                Currency.unwrap(e.key.currency0), Currency.unwrap(e.key.currency1), e.p0, e.p1
-            );
+            address c0 = Currency.unwrap(e.key.currency0);
+            address c1 = Currency.unwrap(e.key.currency1);
+            (uint256 v, uint256 room) = REGISTRY.previewSwapBudget(c0, c1, e.p0, e.p1);
             if (v > room) revert SwapBudgetExceeded(v, room);
+            uint256 room8 = REGISTRY.previewDepthRoom(c0, c1);
+            if (e.valueUsd8 > room8) revert DepthRoomExceeded(e.valueUsd8, room8);
         }
         return e.upperSide;
+    }
+
+    /// @notice The position's automation status in one read (changes no state): mode, whether an operator run would pass
+    ///         now and, if not, its error selector (as `previewTrigger`), the next move time and the moves left of a
+    ///         RECENTER config, whether the Engine may act on the position, whether a swap config's pair version is
+    ///         current, and whether the pair is open to swap flows on the position's pool.
+    function statusOf(uint256 tokenId) external view returns (Status memory s) {
+        Config memory cfg = _configs[tokenId];
+        s.mode = cfg.mode;
+        (s.ready,, s.reason) = this.previewTrigger(tokenId);
+        if (cfg.mode == 0) return s;
+        if (cfg.mode == MODE_RECENTER) {
+            s.nextRunAt = uint40(uint256(cfg.lastRunAt) + cfg.minInterval);
+            s.movesLeft = cfg.budget;
+        }
+        IGoatPosmNft nft = IGoatPosmNft(address(POSM));
+        try nft.getApproved(tokenId) returns (address a) {
+            s.permissionOk = a == address(ENGINE)
+                || (cfg.flags & STANDING != 0 && nft.isApprovedForAll(configOwner[tokenId], address(ENGINE)));
+        } catch {}
+        bool swapCfg = cfg.mode == MODE_RECENTER || cfg.flags & (SWAP_ON_LOWER | SWAP_ON_UPPER) != 0;
+        s.versionOk = !swapCfg;
+        try POSM.getPoolAndPositionInfo(tokenId) returns (PoolKey memory key, PositionInfo) {
+            try REGISTRY.poolInfo(Currency.unwrap(key.currency0), Currency.unwrap(key.currency1), PoolId.unwrap(key.toId()))
+            returns (int24, uint32 ep, bool open, bool) {
+                s.swapsOpen = open;
+                if (swapCfg) s.versionOk = ep == cfg.pairEpoch;
+            } catch {}
+        } catch {}
     }
 }

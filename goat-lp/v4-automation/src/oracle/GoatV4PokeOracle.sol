@@ -14,38 +14,46 @@ import "../lib/GoatV4Errors.sol";
 /**
  * @notice Poke-based price history for Uniswap v4 pools. The v4 core has no oracle, so anyone can call `poke`: each
  *         poke reads the pool's live slot0 tick and in-range liquidity through `PoolManager.extsload` and adds it to a
- *         60 s BUCKET. A bucket keeps the lowest (lo), highest (hi) and last tick of all pokes in it, the poke count,
- *         the smallest liquidity seen by REGISTERED pokes (minL; 0 without a registered poke) and whether a registered
- *         poker touched it (reg).
+ *         60 s BUCKET. There are TWO rings of buckets per pool:
+ *           - the REGISTERED ring, written only by registered pokers. It is the only data `consult` reads, so it is the
+ *             only data the registry and the meter act on (window medians, spread, newest-bucket range, minL);
+ *           - the SIGNAL ring, written only by every other caller. Nothing on chain reads it: it is a monitoring signal,
+ *             exposed through `openBucketAt` and `consultAll`.
+ *         A bucket keeps the lowest (lo), highest (hi) and last tick of the pokes written into it, the poke count and,
+ *         on the registered ring, the smallest in-range liquidity seen (minL).
  *
- * @dev Range buckets: a bucket keeps the range of every poke in its slot rather than a single sample, because a v4
- *      pool has no start-of-block tick. An extra poke can only lower a bucket's lo or raise its hi, so medLo can only
- *      fall and medHi can only rise. A floor built on the median that favours the user (medHi when selling token0,
- *      medLo when selling token1) can therefore only become stricter, and moving a median takes a majority (>= 8) of
- *      the 15 buckets. medMid, the median of bucket midpoints (lo + hi) / 2, has no such direction, so every consumer
- *      of medMid bounds it with a spread limit (`spreadMax <= G`) or the [medLo, medHi] clamp, as the registry does.
- * @dev Spread statistic: `spreadMax` (name kept for interface compatibility) is the LOWER MEDIAN of bucket hi − lo
+ * @dev Why two rings: pokes from any caller used to count toward the shared buckets; they now go to a separate signal
+ *      ring. A poke by an unregistered caller changes none of the values `consult` returns (medians, spread, newest-
+ *      bucket range, minL, the 15/15 counters); it only shows up in the monitoring views.
+ * @dev Range buckets: a registered bucket keeps the range of every registered poke in its slot rather than a single
+ *      sample, because a v4 pool has no start-of-block tick. Our poker reads 2-3 times per bucket at random seconds. An
+ *      extra registered poke can only lower a bucket's lo or raise its hi, so medLo can only fall and medHi can only
+ *      rise. A floor built on the median that favours the user (medHi when selling token0, medLo when selling token1)
+ *      can therefore only become stricter, and moving a median takes a majority (>= 8) of the 15 buckets. medMid, the
+ *      median of bucket midpoints (lo + hi) / 2, has no such direction, so every consumer of medMid bounds it with a
+ *      spread limit (`spreadMax <= G`) or the [medLo, medHi] clamp, as the registry does.
+ * @dev Spread statistic: `spreadMax` (name kept for interface compatibility) is the LOWER MEDIAN of bucket hi - lo
  *      (the 8th largest of 15), not the widest bucket, so a single wide bucket does not close the swap flows for the
- *      whole window. It exceeds G only when a majority of the buckets are wider than G.
+ *      whole window. It exceeds G only when a majority of the registered buckets are wider than G.
  * @dev No poke while the PoolManager is unlocked (inside an `unlock` callback, read from its IS_UNLOCKED transient
- *      slot): `PokeWhileUnlocked`. A price reached inside an unlock does not have to be settled until the callback
- *      ends, so it is never recorded.
- * @dev Tick from the price: when a zeroForOne swap leaves the price exactly on initialized tick k, slot0.tick = k − 1.
+ *      slot): `PokeWhileUnlocked`, on both rings. A price reached inside an unlock does not have to be settled until
+ *      the callback ends, so it is never recorded.
+ * @dev Tick from the price: when a zeroForOne swap leaves the price exactly on initialized tick k, slot0.tick = k - 1.
  *      The bucket records the price's tick (as TickMath.getTickAtSqrtPrice: tick + 1 when sqrtP == P(tick + 1)).
  *
- * @dev Registered pokers: only addresses the owner adds through a 24-hour timelock set `reg` on a bucket. The consumer
- *      (the registry) requires a registered poke in EACH of the last 15 complete slots (15/15), so a gap in registered
- *      pokes pauses swap flows on POKE rows until the window is full again (fail-closed). Unregistered pokes can only
- *      widen a bucket's range.
+ * @dev Registered pokers: only addresses the owner adds through a 1-hour timelock write the registered ring. The
+ *      consumer (the registry) requires a registered bucket in EACH of the last 15 complete slots (15/15), so a gap in
+ *      registered pokes pauses swap flows on POKE rows until the window is full again (fail-closed).
+ *      Every value the consumers read comes from these keys, so they are trusted keys: the owner or the guardian
+ *      removes a poker at once (`removePoker`).
  *
- * @dev minL comes from registered pokes only: a bucket opened by an unregistered poke carries minL = 0, the first
- *      registered poke SETS minL to its own liquidity and later registered pokes keep the minimum; `consult` takes minL
- *      only from `reg` buckets (0 if there are none). minL feeds the POKE source's time-weighted depth
- *      (VD4 = walk · min(1, minL / L_now)).
+ * @dev minL: the first registered poke of a bucket SETS minL to its own liquidity and later registered pokes keep the
+ *      minimum; `consult` returns the smallest minL of the window (0 if the window has no bucket). minL feeds the POKE
+ *      source's time-weighted depth (VD4 = walk * min(1, minL / L_now)). Signal buckets carry minL = 0.
  *
  * @dev Structure: holds no tokens or ETH; its only external calls are the `extsload` / `exttload` views (no reentrancy
  *      surface); no proxy or delegatecall. The PoolManager is pinned to K.POOL_MANAGER in the constructor.
- *      Ring: 64 buckets per pool, slot index (start / 60) mod 64; a stale bucket is recognised by its start time.
+ *      Rings: 64 buckets per pool each, slot index (start / 60) mod 64; a stale bucket is recognised by its start time.
  */
 contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
     // ------------------------------------------------------------------ constants
@@ -56,7 +64,7 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
     uint256 public constant CARD = 64;
     /// @notice `consult` window: the 15 COMPLETE slots before the current one (= K.POKE_WINDOW; registry and meter require 15/15).
     uint256 public constant WINDOW = K.POKE_WINDOW;
-    uint256 internal constant TIMELOCK = 24 hours;
+    uint256 internal constant TIMELOCK = 1 hours;
     uint256 internal constant QUEUE_GRACE = 7 days;
     /// @dev Slot of PoolManager's `_pools` mapping and the liquidity offset inside `Pool.State` (layout facts).
     uint256 internal constant POOLS_SLOT = 6;
@@ -64,16 +72,16 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
 
     // ------------------------------------------------------------------ types
 
-    /// @notice One slot (256 bits). `last` and `n` are not read on chain: they serve off-chain diagnostics through
-    ///         `bucketAt` and share the slot, so they cost no extra SSTORE.
+    /// @notice One slot (256 bits), the same layout on both rings. `last` and `n` are not read on chain: they serve
+    ///         off-chain diagnostics through `bucketAt` / `openBucketAt` and share the slot, so they cost no extra SSTORE.
     struct Bucket {
         uint32 start; // bucket start (a multiple of 60); 0 = empty
         int24 lo;
         int24 hi;
         int24 last;
-        uint16 n; // number of pokes in the bucket (saturating)
-        bool reg; // a registered poker touched it
-        uint128 minL; // smallest in-range liquidity seen by REGISTERED pokes (0 if none)
+        uint16 n; // number of pokes written into this bucket (saturating)
+        bool reg; // true on the registered ring, false on the signal ring
+        uint128 minL; // registered ring: smallest in-range liquidity seen; signal ring: always 0
     }
 
     // ------------------------------------------------------------------ state
@@ -82,7 +90,10 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
     address public guardian;
     mapping(address => bool) public isPoker;
     mapping(address => uint256) public pokerQueuedAt;
+    /// @dev Registered ring: written only by registered pokers; the only ring `consult` reads.
     mapping(bytes32 => Bucket[CARD]) internal _buckets;
+    /// @dev Signal ring: written only by other callers; read only by the monitoring views (`openBucketAt`, `consultAll`).
+    mapping(bytes32 => Bucket[CARD]) internal _open;
 
     // ------------------------------------------------------------------ events
 
@@ -115,7 +126,7 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
         emit GuardianSet(g);
     }
 
-    /// @notice Adding a poker waits for a 24-hour timelock (a registered poke counts toward the consumer's 15/15 rule).
+    /// @notice Adding a poker waits for a 1-hour timelock (a registered poke counts toward the consumer's 15/15 rule).
     function queuePoker(address p) external onlyOwner {
         if (p == address(0)) revert BadValue();
         pokerQueuedAt[p] = block.timestamp;
@@ -169,8 +180,9 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
         }
         uint256 slot = block.timestamp / SPACING;
         uint32 start = uint32(slot * SPACING);
-        Bucket storage s = _buckets[id][slot % CARD];
-        Bucket memory b = s;
+        uint256 i = slot % CARD;
+        // A registered poke writes ONLY the registered ring, any other poke ONLY the signal ring: the two never mix.
+        Bucket memory b = r ? _buckets[id][i] : _open[id][i];
         bool fresh = b.start != start;
         if (fresh) {
             b = Bucket(start, tick, tick, tick, 1, r, r ? liq : 0);
@@ -181,12 +193,10 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
             unchecked {
                 if (b.n != type(uint16).max) ++b.n;
             }
-            if (r) {
-                if (!b.reg || liq < b.minL) b.minL = liq;
-                b.reg = true;
-            }
+            if (r && liq < b.minL) b.minL = liq;
         }
-        _buckets[id][slot % CARD] = b;
+        if (r) _buckets[id][i] = b;
+        else _open[id][i] = b;
         emit Poked(id, start, tick, fresh, r);
     }
 
@@ -205,19 +215,41 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
 
     // ================================================================== READS
 
-    /// @notice The bucket `k` slots back (k = 0 is the current slot). If its start is not that slot (stale or empty), `start` differs.
+    /// @notice The REGISTERED bucket `k` slots back (k = 0 is the current slot). If its start is not that slot (stale or
+    ///         empty), `start` differs: that slot has no registered poke.
     function bucketAt(bytes32 id, uint256 k) external view returns (Bucket memory) {
         return _buckets[id][(block.timestamp / SPACING - k) % CARD];
     }
 
+    /// @notice MONITORING ONLY: the signal bucket (other callers' pokes) `k` slots back. Nothing on chain reads it.
+    function openBucketAt(bytes32 id, uint256 k) external view returns (Bucket memory) {
+        return _open[id][(block.timestamp / SPACING - k) % CARD];
+    }
+
     /**
-     * @notice Summary of the last 15 COMPLETE slots (the current slot excluded). Slot k (1..15) counts only if a bucket
-     *         starts exactly at `(now/60 − k)·60` (`complete`); `registered` counts those with a registered poke. The
-     *         medians are LOWER medians over the existing buckets; `spreadMax` = the lower median of bucket hi − lo (NOT
-     *         the widest); `newLo/newHi` come from slot 1 and, if present, the current slot 0. The consumer requires
-     *         15/15. `age` is not read on chain (off-chain diagnostics; freshness comes from the 15/15 rule).
+     * @notice Summary of the last 15 COMPLETE slots (the current slot excluded), from the REGISTERED ring only. Slot k
+     *         (1..15) counts only if a registered bucket starts exactly at `(now/60 - k)*60`; `complete` and
+     *         `registered` are therefore equal (both kept for interface compatibility). The medians are LOWER medians
+     *         over those buckets; `spreadMax` = the lower median of bucket hi - lo (NOT the widest); `newLo/newHi` come
+     *         from slot 1 and, if present, the current slot 0. The consumer requires 15/15. `age` is not read on chain
+     *         (off-chain diagnostics; freshness comes from the 15/15 rule). Pokes by other callers change nothing here.
      */
     function consult(bytes32 id) external view returns (PokeWindow memory w) {
+        return _summary(id, false);
+    }
+
+    /**
+     * @notice MONITORING ONLY (nothing on chain reads it): the same summary over the UNION of both rings, i.e. every
+     *         caller's pokes, which is what `consult` returned in the previous version. `complete` counts slots with any
+     *         poke, `registered` those with a registered one. A keeper compares it with `consult` to raise an alarm when
+     *         outside pokes would have widened the window.
+     */
+    function consultAll(bytes32 id) external view returns (PokeWindow memory w) {
+        return _summary(id, true);
+    }
+
+    /// @dev The window summary; `all` = union of both rings (monitoring), else the registered ring only (consumers).
+    function _summary(bytes32 id, bool all) internal view returns (PokeWindow memory w) {
         uint256 cur = block.timestamp / SPACING;
         int24[] memory los = new int24[](WINDOW);
         int24[] memory his = new int24[](WINDOW);
@@ -228,14 +260,18 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
         uint128 minL = type(uint128).max;
         uint256 newest;
         Bucket memory b = _buckets[id][cur % CARD];
-        if (b.start == cur * SPACING) {
+        bool ok = b.start == cur * SPACING;
+        if (all) (ok, b) = _withOpen(id, cur, ok, b);
+        if (ok) {
             (nLo, nHi, newest) = (b.lo, b.hi, b.start);
         }
         uint256 n;
         for (uint256 k = 1; k <= WINDOW; ++k) {
             uint256 s = cur - k;
             b = _buckets[id][s % CARD];
-            if (b.start != s * SPACING) continue;
+            ok = b.start == s * SPACING;
+            if (all) (ok, b) = _withOpen(id, s, ok, b);
+            if (!ok) continue;
             if (b.reg) {
                 ++w.registered;
                 if (b.minL < minL) minL = b.minL;
@@ -262,6 +298,23 @@ contract GoatV4PokeOracle is Ownable2Step, IGoatPokeOracle {
         if (w.registered != 0) w.minL = minL;
         if (nLo <= nHi) (w.newLo, w.newHi) = (nLo, nHi);
         w.age = newest == 0 ? type(uint32).max : uint32(block.timestamp - newest);
+    }
+
+    /**
+     * @dev Monitoring path only (`consultAll`): slot `s`'s registered bucket `b` (`ok` = it exists for exactly that
+     *      slot) merged with the signal bucket of the same slot: lo = min, hi = max, n = sum (saturating); `reg` and
+     *      `minL` come from the registered bucket (a signal-only slot has reg = false, minL = 0), as one shared bucket
+     *      had them in the previous version. `consult` never calls it.
+     */
+    function _withOpen(bytes32 id, uint256 s, bool ok, Bucket memory b) internal view returns (bool, Bucket memory) {
+        Bucket memory o = _open[id][s % CARD];
+        if (o.start != s * SPACING) return (ok, b);
+        if (!ok) return (true, o);
+        if (o.lo < b.lo) b.lo = o.lo;
+        if (o.hi > b.hi) b.hi = o.hi;
+        uint256 m = uint256(b.n) + o.n;
+        b.n = m > type(uint16).max ? type(uint16).max : uint16(m);
+        return (true, b);
     }
 
     /// @dev Lower median of the first `n` items (in-place insertion sort; n <= 15).

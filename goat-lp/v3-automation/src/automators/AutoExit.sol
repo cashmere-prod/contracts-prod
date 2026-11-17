@@ -5,8 +5,11 @@
 // listed pairs with a veto pool; a swap-less exit is triggered by the pool's spot tick on every pair. Swaps go through
 // the Universal Router only, with route, depth and swap-budget checks, a 900 s TWAP veto, a gate between spot and
 // anchor, a minimum output from the anchor price net of the pool fee, and a last swap command that spends the full
-// input. Fixed 0.15% exit fee that can only be lowered; the config is bound to the owner who wrote it; owed tokens are
-// collected to the owner first; pause and nonReentrant.
+// input. Fixed 0.15% exit fee that can only be lowered; the config is bound to the owner who wrote it; its fees are
+// collected to the owner first; nonReentrant. The pause stops every exit that reads the anchor (every swap side and
+// every anchored exit); an exit without a swap that the pool's spot triggered still runs while paused, since it needs
+// no outside price and pays only the owner. revokeOperator (owner or guardian, at once) stops every run. A config can
+// be written together with the position manager's permit (configTokenWithPermit), and ruleOf reads a rule in one call.
 // Goat: pragma pinned to the compiler of the deployed build (solc 0.8.24)
 pragma solidity 0.8.24;
 
@@ -32,6 +35,16 @@ contract AutoExit is Automator, GoatRobinhood {
     );
     // Goat: exit fee changes
     event ExitFeeUpdated(address account, uint64 feeX64);
+    // Goat: a piece of a swap exit that leaves liquidity in the position, with Executed's fields; the config stays on the
+    // rest. The run that empties the position emits Executed and deletes the config, as a whole exit does.
+    event ExitPiece(
+        uint256 indexed tokenId,
+        uint128 liquidityTaken,
+        uint128 liquidityLeft,
+        bool isSwap,
+        uint256 amountReturned0,
+        uint256 amountReturned1
+    );
 
     event Executed(
         uint256 indexed tokenId,
@@ -145,6 +158,8 @@ contract AutoExit is Automator, GoatRobinhood {
         uint16 anchorGate;
         IUniswapV3Pool vetoPool;
         uint64 floorX64;
+        // Goat: the liquidity this run takes
+        uint128 take;
     }
 
     /**
@@ -152,8 +167,25 @@ contract AutoExit is Automator, GoatRobinhood {
      * Can only be called only from configured operator account
      * Swap needs to be done with max price difference from current pool price - otherwise reverts
      */
-    // Goat: whenNotPaused and nonReentrant
-    function execute(ExecuteParams calldata params) external whenNotPaused nonReentrant {
+    // Goat: nonReentrant. The pause is checked on the anchored path only (see below).
+    function execute(ExecuteParams calldata params) external nonReentrant {
+        ExecuteState memory state;
+        _execute(params, state);
+    }
+
+    /// @notice A piece of a swap exit: takes `liquidity` of the position (all of it at or above the position's
+    ///         liquidity) through every check of execute, the trigger included, and sells it; the rule stays on the
+    ///         position until it is empty. A swap-less exit never reads the room and runs whole: a piece of it reverts
+    ///         InvalidConfig.
+    function executePiece(ExecuteParams calldata params, uint128 liquidity) external nonReentrant {
+        if (liquidity == 0) revert NoLiquidity();
+        ExecuteState memory state;
+        state.take = liquidity;
+        _execute(params, state);
+    }
+
+    // Goat: state.take is the piece asked for (0 = the whole position)
+    function _execute(ExecuteParams calldata params, ExecuteState memory state) internal {
         if (!operators[msg.sender]) {
             revert Unauthorized();
         }
@@ -173,8 +205,6 @@ contract AutoExit is Automator, GoatRobinhood {
             revert ExceedsMaxReward();
         }
 
-        ExecuteState memory state;
-
         // Goat: is the owner who wrote the config still the owner?
         state.owner = nonfungiblePositionManager.ownerOf(params.tokenId);
         if (state.owner != positionConfigOwners[params.tokenId]) {
@@ -183,15 +213,14 @@ contract AutoExit is Automator, GoatRobinhood {
 
         // get position info
         // Goat: tokensOwed is read as well
-        (,, state.token0, state.token1, state.fee, state.tickLower, state.tickUpper, state.liquidity,,, state.owed0, state.owed1) =
-            nonfungiblePositionManager.positions(params.tokenId);
-        // Goat: owed tokens are first collected DIRECTLY to the owner (they never enter this contract, and the swap and
-        // the fee are based on the position alone), so dust added to the position by anyone cannot block the exit
-        if (state.owed0 != 0 || state.owed1 != 0) {
-            nonfungiblePositionManager.collect(
-                INonfungiblePositionManager.CollectParams(params.tokenId, state.owner, type(uint128).max, type(uint128).max)
-            );
-        }
+        _readPosition(params.tokenId, state);
+        // Goat: the position's fees are first collected DIRECTLY to the owner, on every run: the owed tokens and the
+        // fees accrued since the last update (the collect updates them first). They never enter this contract, so the
+        // swap, the fee and the charge to the room and the budget come from the principal the run removes alone, and
+        // dust added to the position by anyone cannot block the exit
+        nonfungiblePositionManager.collect(
+            INonfungiblePositionManager.CollectParams(params.tokenId, state.owner, type(uint128).max, type(uint128).max)
+        );
 
         // so can be executed only once
         if (state.liquidity == 0) {
@@ -220,6 +249,9 @@ contract AutoExit is Automator, GoatRobinhood {
             if (!config.token0Swap && !config.token1Swap) {
                 revert NotReady();
             }
+            // Goat: the pause stops this path (it needs the anchor and may swap); the spot-triggered exit without a
+            // swap needs no outside price and keeps running while paused
+            _requireNotPaused();
             // Goat: the swap side is triggered by the ANCHOR (from the pair table; only pairs with a veto pool)
             state.anchored = true;
             (state.anchorTick, state.anchorSqrtPriceX96, state.anchorGate, state.vetoPool) =
@@ -238,8 +270,11 @@ contract AutoExit is Automator, GoatRobinhood {
         }
 
         // decrease full liquidity for given position - and return fees as well
+        // Goat: the liquidity this run takes: a piece, or the whole position. Pieces are for swap exits only.
+        state.take = state.take == 0 || state.take >= state.liquidity ? state.liquidity : state.take;
+        if (state.take != state.liquidity && !state.isSwap) revert InvalidConfig();
         (state.amount0, state.amount1, state.feeAmount0, state.feeAmount1) = _decreaseFullLiquidityAndCollect(
-            params.tokenId, state.liquidity, params.amountRemoveMin0, params.amountRemoveMin1, params.deadline
+            params.tokenId, state.take, params.amountRemoveMin0, params.amountRemoveMin1, params.deadline
         );
 
         // swap to other token
@@ -343,17 +378,30 @@ contract AutoExit is Automator, GoatRobinhood {
 
         // Goat: effects before interactions: config deleted and events emitted before the owner payout
 
-        // delete config for position
-        delete positionConfigs[params.tokenId];
-        // Goat: config owner
-        delete positionConfigOwners[params.tokenId];
-        emit PositionConfigured(params.tokenId, false, false, false, 0, 0, 0, 0, false, 0);
+        // Goat: only the run that empties the position deletes the config and emits Executed (the whole-exit shape); a
+        // piece leaves the rule on the rest and emits ExitPiece
+        if (state.take == state.liquidity) {
+            // delete config for position
+            delete positionConfigs[params.tokenId];
+            // Goat: config owner
+            delete positionConfigOwners[params.tokenId];
+            emit PositionConfigured(params.tokenId, false, false, false, 0, 0, 0, 0, false, 0);
 
-        // log event
-        // Goat: isSwap = a swap ran (swapAmount is set only on the swap side; 0 = nothing swapped)
-        emit Executed(
-            params.tokenId, msg.sender, state.swapAmount != 0, state.amount0, state.amount1, state.token0, state.token1
-        );
+            // log event
+            // Goat: isSwap = a swap ran (swapAmount is set only on the swap side; 0 = nothing swapped)
+            emit Executed(
+                params.tokenId, msg.sender, state.swapAmount != 0, state.amount0, state.amount1, state.token0, state.token1
+            );
+        } else {
+            emit ExitPiece(
+                params.tokenId,
+                state.take,
+                state.liquidity - state.take,
+                state.swapAmount != 0,
+                state.amount0,
+                state.amount1
+            );
+        }
         // Goat: execution details
         emit GoatExitExecuted(
             params.tokenId,
@@ -371,6 +419,12 @@ contract AutoExit is Automator, GoatRobinhood {
         if (state.amount1 != 0) {
             _transferToken(state.owner, IERC20(state.token1), state.amount1, true);
         }
+    }
+
+    // Goat: the position read of execute, in its own frame (keeps execute's stack small)
+    function _readPosition(uint256 tokenId, ExecuteState memory state) internal view {
+        (,, state.token0, state.token1, state.fee, state.tickLower, state.tickUpper, state.liquidity,,, state.owed0, state.owed1) =
+            nonfungiblePositionManager.positions(tokenId);
     }
 
     // Goat: best-effort: true only when the table's anchor reads and lies on a configured swap side. A failed read (no
@@ -397,6 +451,44 @@ contract AutoExit is Automator, GoatRobinhood {
     // it needs to have approvals set for this contract beforehand
     // Goat: nonReentrant
     function configToken(uint256 tokenId, PositionConfig calldata config) external nonReentrant {
+        _configToken(tokenId, config);
+    }
+
+    // Goat: the same as configToken, after applying the owner's position-manager permit for this contract (one
+    // signature and one transaction instead of an approval transaction first). Only the owner can call it
+    // (configToken's owner check); the permit is for this position and this contract only.
+    function configTokenWithPermit(
+        uint256 tokenId,
+        PositionConfig calldata config,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external nonReentrant {
+        _permitSelf(tokenId, deadline, v, r, s);
+        _configToken(tokenId, config);
+    }
+
+    // Goat: one read of a rule for the site and the keeper: the config, the address that wrote it, the current owner
+    // (address(0) for a burned position), whether this contract is allowed for the position, and its liquidity. The
+    // rule runs only while writer == owner. Never reverts.
+    function ruleOf(uint256 tokenId)
+        external
+        view
+        returns (PositionConfig memory config, address writer, address holder, bool allowed, uint128 liquidity)
+    {
+        config = positionConfigs[tokenId];
+        writer = positionConfigOwners[tokenId];
+        try nonfungiblePositionManager.ownerOf(tokenId) returns (address o) {
+            holder = o;
+        } catch {
+            return (config, writer, address(0), false, 0);
+        }
+        allowed = _allowedFor(tokenId, holder);
+        (,,,,,,, liquidity,,,,) = nonfungiblePositionManager.positions(tokenId);
+    }
+
+    function _configToken(uint256 tokenId, PositionConfig calldata config) internal {
         if (config.isActive) {
             if (config.token0TriggerTick >= config.token1TriggerTick) {
                 revert InvalidConfig();
@@ -461,7 +553,7 @@ contract AutoExit is Automator, GoatRobinhood {
         revert InvalidConfig();
     }
 
-    // Goat: binds the pair table once (it cannot change later; the table's rows change under its own 24 h timelock);
+    // Goat: binds the pair table once (it cannot change later; the table's rows change under its own 1 h timelock);
     // onlyOwner, then nonReentrant
     function setPairTable(GoatPairTable table) external onlyOwner nonReentrant {
         _setPairTable(table);

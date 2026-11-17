@@ -8,7 +8,7 @@ import {HourlyLimitHit} from "./GoatV4Errors.sol";
  *
  * @dev The limit is off by default: `capacity == 0` means no limit and `consume` does nothing. The owner can turn it
  *      on later. Turning it on or lowering it is a tightening and applies immediately; raising it or turning it off
- *      waits for the 24-hour timelock (`GoatV4StewardCore`).
+ *      waits for the 1-hour timelock (`GoatV4StewardCore`).
  * @dev When on: capacity C, refilled at C per 3600 s. A single spend is at most C, and the total spent in any one-hour
  *      window is at most 2C (the full bucket at the start of the window plus the refill during it).
  */

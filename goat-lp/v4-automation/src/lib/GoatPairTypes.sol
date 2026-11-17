@@ -8,7 +8,8 @@ pragma solidity 0.8.26;
 struct FeedRule {
     /// @dev Chainlink proxy address (not the aggregator; the proxy is pinned).
     address feed;
-    /// @dev Maximum age (s): the feed's own heartbeat plus a margin. Registry upper bound `MAX_FEED_AGE` (25 h).
+    /// @dev Maximum age (s): the feed's own heartbeat plus a margin. Meter upper bound `MAX_FEED_AGE` (25 h); on the USDG/USD feed
+    ///      `MAX_FEED_AGE_USDG` (30 h).
     uint32 maxAge;
     /// @dev Stock/RWA feed (US stock 24/5 calendar): fail-closed at the weekly close, in the first hour after the
     ///      reopening, and while relying on a round written before this week's open.
@@ -30,6 +31,7 @@ struct PoolSpec {
     /// @dev MEASURED: the swap fillable from spot to anchor ∓ G, the smaller of the two directions (whole USD).
     ///      Informational (keeper / frontend size warning); on chain only its lower bound (`MIN_POOL_FILL_USD`) and the
     ///      ±100-tick walk are enforced. NOT semantic: refreshing it does not bump the pair version.
+    ///      Stored as listed: a row listed again at another G keeps the figure it is given (it is not re-measured).
     uint32 fillUsd;
 }
 
@@ -88,7 +90,7 @@ struct NcPairConfig {
     ///      may be UNLIMITED. NOT semantic.
     uint128 capX;
     /// @dev Slow reference (SR, the "price speed limit"): follows the source's TWAP900 by at most this many ticks per
-    ///      hour ([SR_RATE_MIN, SR_RATE_MAX]). NOT semantic: owner or guardian LOWERS it immediately; a raise waits 24 h.
+    ///      hour ([SR_RATE_MIN, SR_RATE_MAX]). NOT semantic: owner or guardian LOWERS it immediately; a raise waits 1 h.
     uint16 slowRate;
     PoolSpec[] pools;
 }
